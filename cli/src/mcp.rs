@@ -3913,6 +3913,8 @@ fn dashboard_start_args(arguments: &Value) -> Result<Vec<String>, ProtocolError>
     Ok(args)
 }
 
+// Canvas frame geometry is a WebSocket concern, not a separate MCP tool.
+// Keep dashboard startup delegated through the canonical CLI parser.
 fn call_dashboard_start(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, dashboard_start_args(arguments)?, None)
 }

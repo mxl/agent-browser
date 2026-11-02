@@ -24,6 +24,25 @@ fn frame_timestamp_ms(meta: Option<&Value>) -> u64 {
         .unwrap_or(0)
 }
 
+/// Preserve the actual screen DIP geometry, not the configured viewport or
+/// JPEG pixel dimensions. Chrome already accounts for device scale (DPR).
+fn frame_metadata(meta: Option<&Value>, fallback_width: u32, fallback_height: u32) -> Value {
+    let number = |field: &str, fallback: f64| {
+        meta.and_then(|m| m.get(field))
+            .and_then(Value::as_f64)
+            .unwrap_or(fallback)
+    };
+    json!({
+        "offsetTop": number("offsetTop", 0.0),
+        "pageScaleFactor": number("pageScaleFactor", 1.0),
+        "deviceWidth": number("deviceWidth", fallback_width as f64),
+        "deviceHeight": number("deviceHeight", fallback_height as f64),
+        "scrollOffsetX": number("scrollOffsetX", 0.0),
+        "scrollOffsetY": number("scrollOffsetY", 0.0),
+        "timestamp": frame_timestamp_ms(meta),
+    })
+}
+
 fn session_matches(active_session: Option<&str>, event_session: Option<&str>) -> bool {
     match active_session {
         Some("") => event_session.is_none_or(str::is_empty),
@@ -447,15 +466,7 @@ pub(super) async fn cdp_event_loop(
                                                 "type": "frame",
                                                 "seq": seq,
                                                 "data": data,
-                                                "metadata": {
-                                                    "offsetTop": meta.and_then(|m| m.get("offsetTop")).and_then(|v| v.as_f64()).unwrap_or(0.0),
-                                                    "pageScaleFactor": meta.and_then(|m| m.get("pageScaleFactor")).and_then(|v| v.as_f64()).unwrap_or(1.0),
-                                                    "deviceWidth": vw,
-                                                    "deviceHeight": vh,
-                                                    "scrollOffsetX": meta.and_then(|m| m.get("scrollOffsetX")).and_then(|v| v.as_f64()).unwrap_or(0.0),
-                                                    "scrollOffsetY": meta.and_then(|m| m.get("scrollOffsetY")).and_then(|v| v.as_f64()).unwrap_or(0.0),
-                                                    "timestamp": frame_timestamp_ms(meta),
-                                                }
+                                                "metadata": frame_metadata(meta, vw, vh)
                                             });
 
                                             // The session or viewport can change while the
@@ -974,6 +985,37 @@ mod tests {
             .expect("test frame should be cached");
         let payload: Value = serde_json::from_str(&frame.json).unwrap();
         assert_eq!(payload["data"], data);
+    }
+
+    #[test]
+    fn test_frame_metadata_preserves_actual_dip_geometry() {
+        let meta = json!({
+            "deviceWidth": 973.5, "deviceHeight": 641.25,
+            "offsetTop": 32.5, "pageScaleFactor": 2.0,
+            "scrollOffsetX": 10.5, "scrollOffsetY": 420.25,
+            "timestamp": 123.456,
+        });
+        let forwarded = frame_metadata(Some(&meta), 1280, 720);
+        for field in [
+            "deviceWidth",
+            "deviceHeight",
+            "offsetTop",
+            "pageScaleFactor",
+            "scrollOffsetX",
+            "scrollOffsetY",
+        ] {
+            assert_eq!(forwarded[field], meta[field], "must preserve {field}");
+        }
+        assert_eq!(forwarded["timestamp"], 123456);
+    }
+
+    #[test]
+    fn test_frame_metadata_falls_back_only_for_missing_values() {
+        let forwarded = frame_metadata(Some(&json!({"deviceWidth": 800.0})), 1280, 720);
+        assert_eq!(forwarded["deviceWidth"].as_f64(), Some(800.0));
+        assert_eq!(forwarded["deviceHeight"].as_f64(), Some(720.0));
+        assert_eq!(forwarded["offsetTop"].as_f64(), Some(0.0));
+        assert_eq!(forwarded["pageScaleFactor"].as_f64(), Some(1.0));
     }
 
     /// Reading the float as an integer stamps every frame 0, so no client can

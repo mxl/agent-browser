@@ -3322,6 +3322,9 @@ Usage: agent-browser dashboard [start|stop] [options]
 Manage the observability dashboard, a local web UI that shows live
 browser viewports and command activity feeds for all sessions.
 The dashboard is bundled into the binary and requires no separate install.
+Canvas pointer input uses the drawn frame's device-independent geometry,
+including its top offset, rather than configured viewport or JPEG dimensions.
+This WebSocket behavior adds no CLI command or MCP tool.
 
 Subcommands:
   start [--port <n>] [--allowed-origins <origins>]

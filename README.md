@@ -1156,6 +1156,8 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 
 Monitor agent-browser sessions in real time with a local web dashboard showing a live viewport and command activity feed.
 
+Dashboard pointer input uses the geometry of the frame drawn on the canvas, including Chrome's top offset and device-independent dimensions. Encoded image size and local display scaling do not change browser input coordinates. These are WebSocket rendering and input behaviors, not additional CLI commands or MCP tools.
+
 ```bash
 # Start the dashboard server (runs in background on port 4848)
 agent-browser dashboard start

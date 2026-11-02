@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef } from "react";
 import { useSetAtom } from "jotai/react";
 import type {
   ActivityEvent,
+  FrameMessage,
   ConsoleEntry,
   StreamMessage,
   TabInfo,
@@ -24,7 +25,8 @@ export const screencastingAtom = atom(false);
 export const recordingAtom = atom(false);
 export const viewportWidthAtom = atom(1280);
 export const viewportHeightAtom = atom(720);
-export const currentFrameAtom = atom<string | null>(null);
+// Keep pixels and metadata together; input must use the frame actually drawn.
+export const currentFrameAtom = atom<FrameMessage | null>(null);
 export const streamEventsAtom = atom<ActivityEvent[]>([]);
 export const consoleLogsAtom = atom<ConsoleEntry[]>([]);
 export const streamTabsAtom = atom<TabInfo[]>([]);
@@ -150,7 +152,7 @@ export function useStreamSync(port: number) {
 
       switch (msg.type) {
         case "frame":
-          setFrame(msg.data);
+          setFrame(msg);
           break;
 
         case "status":

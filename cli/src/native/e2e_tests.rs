@@ -10150,18 +10150,8 @@ async fn e2e_stream_frame_metadata_respects_custom_viewport() {
             serde_json::from_str(message.to_text().expect("text message should be readable"))
                 .expect("stream payload should be valid JSON");
         if parsed.get("type") == Some(&json!("frame")) {
-            let meta = &parsed["metadata"];
-            assert_eq!(
-                meta["deviceWidth"], 800,
-                "frame metadata deviceWidth should match custom viewport, got: {}",
-                meta
-            );
-            assert_eq!(
-                meta["deviceHeight"], 600,
-                "frame metadata deviceHeight should match custom viewport, got: {}",
-                meta
-            );
-
+            // CDP can emit old geometry until the resize settles. Validate
+            // metadata against the settled JPEG, not a configured override.
             let data_str = parsed
                 .get("data")
                 .and_then(|v| v.as_str())
@@ -10175,6 +10165,9 @@ async fn e2e_stream_frame_metadata_respects_custom_viewport() {
             if img_w != 800 || img_h != 600 {
                 continue;
             }
+            let meta = &parsed["metadata"];
+            assert_eq!(meta["deviceWidth"].as_f64(), Some(800.0));
+            assert_eq!(meta["deviceHeight"].as_f64(), Some(600.0));
 
             found_frame = true;
             break;
