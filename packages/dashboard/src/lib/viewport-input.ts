@@ -41,3 +41,33 @@ export function viewportPoint(
   return { x: Math.round(x), y: Math.round(y) };
 }
 
+type BoundInput = Record<string, unknown> & { bindingEpoch: string };
+
+/** Input epochs originate only on drawn server frames. Rebinding invalidates pixels. */
+export class CanvasInputState {
+  bindingEpoch: string | null = null;
+  drawn: { bindingEpoch: string; geometry: FrameGeometry } | null = null;
+
+  bind(epoch: string | null) {
+    if (epoch === this.bindingEpoch) return false;
+    this.bindingEpoch = epoch;
+    this.drawn = null;
+    return true;
+  }
+
+  canDraw(epoch: string) {
+    return !!epoch && epoch === this.bindingEpoch;
+  }
+
+  didDraw(epoch: string, geometry: FrameGeometry) {
+    if (!this.canDraw(epoch) || !validFrameGeometry(geometry)) return false;
+    this.drawn = { bindingEpoch: epoch, geometry };
+    return true;
+  }
+
+  boundMessage(message: Record<string, unknown>): BoundInput | null {
+    if (!this.drawn || this.drawn.bindingEpoch !== this.bindingEpoch) return null;
+    return { ...message, bindingEpoch: this.drawn.bindingEpoch };
+  }
+
+}

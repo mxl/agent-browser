@@ -20,6 +20,7 @@ const MAX_EVENTS = 500;
 // ---------------------------------------------------------------------------
 
 export const streamConnectedAtom = atom(false);
+export const bindingEpochAtom = atom<string | null>(null);
 export const browserConnectedAtom = atom(false);
 export const screencastingAtom = atom(false);
 export const recordingAtom = atom(false);
@@ -55,11 +56,19 @@ export const hasConsoleErrorsAtom = atom((get) =>
 
 export const sendInputAtom = atom(
   null,
-  (get, _set, msg: Record<string, unknown>) => {
+  (get, _set, msg: Record<string, unknown> & { bindingEpoch: string }) => {
     const ws = get(wsRefAtom);
+    // The caller supplies the DRAWN frame's epoch. Never stamp the latest
+    // binding onto old pixels, including key releases originating in old tabs.
+    if (!get(streamConnectedAtom) || !msg.bindingEpoch ||
+      msg.bindingEpoch !== get(bindingEpochAtom)) return false;
     if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(msg));
+      try {
+        ws.send(JSON.stringify(msg));
+        return true;
+      } catch { return false; }
     }
+    return false;
   },
 );
 
@@ -77,6 +86,8 @@ export const clearConsoleLogsAtom = atom(null, (_get, set) => {
 
 export function useStreamSync(port: number) {
   const setConnected = useSetAtom(streamConnectedAtom);
+  const setBindingEpoch = useSetAtom(bindingEpochAtom);
+  const bindingEpochRef = useRef<string | null>(null);
   const setBrowserConnected = useSetAtom(browserConnectedAtom);
   const setScreencasting = useSetAtom(screencastingAtom);
   const setRecording = useSetAtom(recordingAtom);
@@ -105,6 +116,8 @@ export function useStreamSync(port: number) {
       eventsRef.current = [];
       consoleRef.current = [];
       setConnected(false);
+      bindingEpochRef.current = null;
+      setBindingEpoch(null);
       setBrowserConnected(false);
       setScreencasting(false);
       setRecording(false);
@@ -116,23 +129,32 @@ export function useStreamSync(port: number) {
       setTabs([]);
       setEngine("");
     }
-  }, [port, setConnected, setBrowserConnected, setScreencasting, setRecording, setVpWidth, setVpHeight, setFrame, setEvents, setConsoleLogs, setTabs, setEngine]);
+  }, [port, setBindingEpoch, setConnected, setBrowserConnected, setScreencasting, setRecording, setVpWidth, setVpHeight, setFrame, setEvents, setConsoleLogs, setTabs, setEngine]);
 
   const connect = useCallback(() => {
     if (port <= 0) return;
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
+    bindingEpochRef.current = null;
+    setBindingEpoch(null);
+    setFrame(null);
+    setConnected(false);
     const ws = new WebSocket(getSessionStreamUrl(port));
     wsRef.current = ws;
     setWsRef(ws);
 
     ws.onopen = () => {
+      if (wsRef.current !== ws) return;
       retryCountRef.current = 0;
       setConnected(true);
     };
 
     ws.onclose = () => {
+      if (wsRef.current !== ws) return;
       setConnected(false);
+      bindingEpochRef.current = null;
+      setBindingEpoch(null);
+      setFrame(null);
       const delay = Math.min(2000 * 2 ** retryCountRef.current, 30000);
       retryCountRef.current++;
       reconnectTimerRef.current = setTimeout(connect, delay);
@@ -143,6 +165,7 @@ export function useStreamSync(port: number) {
     };
 
     ws.onmessage = (event) => {
+      if (wsRef.current !== ws) return;
       let msg: StreamMessage;
       try {
         msg = JSON.parse(event.data);
@@ -151,8 +174,19 @@ export function useStreamSync(port: number) {
       }
 
       switch (msg.type) {
+        case "binding": {
+          const epoch = typeof msg.bindingEpoch === "string" && msg.bindingEpoch.length === 36
+            ? msg.bindingEpoch : null;
+          if (epoch !== bindingEpochRef.current) {
+            bindingEpochRef.current = epoch;
+            setBindingEpoch(epoch);
+            setFrame(null);
+          }
+          break;
+        }
         case "frame":
-          setFrame(msg);
+          // Old frames can already be on the wire when binding changes.
+          if (bindingEpochRef.current && msg.bindingEpoch === bindingEpochRef.current) setFrame(msg);
           break;
 
         case "status":
@@ -220,14 +254,20 @@ export function useStreamSync(port: number) {
           break;
       }
     };
-  }, [port, setWsRef, setConnected, setBrowserConnected, setScreencasting, setRecording, setVpWidth, setVpHeight, setFrame, setEvents, setConsoleLogs, setTabs, setEngine, setTabCache, setEngineCache]);
+  }, [port, setBindingEpoch, setWsRef, setConnected, setBrowserConnected, setScreencasting, setRecording, setVpWidth, setVpHeight, setFrame, setEvents, setConsoleLogs, setTabs, setEngine, setTabCache, setEngineCache]);
 
   useEffect(() => {
     connect();
     return () => {
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-      wsRef.current?.close();
+      const ws = wsRef.current;
+      wsRef.current = null;
+      ws?.close();
+      bindingEpochRef.current = null;
+      setBindingEpoch(null);
+      setConnected(false);
+      setFrame(null);
       setWsRef(null);
     };
-  }, [connect, setWsRef]);
+  }, [connect, setWsRef, setBindingEpoch, setConnected, setFrame]);
 }

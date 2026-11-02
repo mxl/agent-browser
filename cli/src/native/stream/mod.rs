@@ -105,6 +105,7 @@ pub(super) fn next_frame_seq() -> u64 {
 /// for both, so the writer never reparses the payload. `None` means the frame
 /// carries no id and the writer must not hold for an ack.
 pub(super) struct StreamFrame {
+    binding_epoch: Option<String>,
     pub(super) seq: Option<u64>,
     pub(super) json: String,
 }
@@ -179,6 +180,51 @@ impl Default for FrameMetadata {
     }
 }
 
+/// Session identity and epoch share one lock. Readers hold it through CDP send;
+/// writers rotate the epoch before a new binding can accept any human input.
+struct StreamBinding {
+    session_id: Option<String>,
+    epoch: String,
+    client: Option<std::sync::Weak<CdpClient>>,
+}
+
+impl StreamBinding {
+    fn new(session_id: Option<String>, client: Option<&Arc<CdpClient>>) -> Self {
+        Self {
+            session_id,
+            epoch: uuid::Uuid::new_v4().to_string(),
+            client: client.map(Arc::downgrade),
+        }
+    }
+
+    fn same_client(&self, client: Option<&Arc<CdpClient>>) -> bool {
+        match (&self.client, client) {
+            (None, None) => true,
+            (Some(old), Some(current)) => {
+                old.upgrade().is_some_and(|old| Arc::ptr_eq(&old, current))
+            }
+            _ => false,
+        }
+    }
+
+    fn epoch_for(&self, client: Option<&Arc<CdpClient>>) -> Option<&str> {
+        (self.session_id.is_some() && client.is_some() && self.same_client(client))
+            .then_some(self.epoch.as_str())
+    }
+
+    fn rebind(&mut self, session_id: Option<String>, client: Option<&Arc<CdpClient>>) -> bool {
+        if self.session_id == session_id && self.same_client(client) {
+            return false;
+        }
+        *self = Self::new(session_id, client);
+        true
+    }
+
+    fn message(&self, client: Option<&Arc<CdpClient>>) -> Value {
+        json!({"type": "binding", "bindingEpoch": self.epoch_for(client)})
+    }
+}
+
 pub struct StreamServer {
     port: u16,
     session_name: String,
@@ -189,8 +235,9 @@ pub struct StreamServer {
     frame_watch: watch::Sender<Option<Arc<StreamFrame>>>,
     client_count: Arc<Mutex<usize>>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
-    /// The active CDP page session ID (from Target.attachToTarget).
-    cdp_session_id: Arc<RwLock<Option<String>>>,
+    /// Active CDP session, owning client identity, and random input epoch.
+    /// Kept in one binding lock so authorization cannot race target rebinding.
+    cdp_session_id: Arc<RwLock<StreamBinding>>,
     client_notify: Arc<Notify>,
     /// Shared activity clock used by the daemon idle timer.
     idle_activity: Arc<IdleActivity>,
@@ -255,6 +302,8 @@ impl StreamServer {
     /// Update the stored viewport dimensions and restart the active screencast (if any)
     /// so frames are captured at the new size.
     pub async fn set_viewport(&self, width: u32, height: u32) {
+        let client = self.client_slot.read().await;
+        let mut binding = self.cdp_session_id.write().await;
         let mut vw = self.viewport_width.lock().await;
         let mut vh = self.viewport_height.lock().await;
         if *vw == width && *vh == height {
@@ -262,6 +311,10 @@ impl StreamServer {
         }
         *vw = width;
         *vh = height;
+        binding.epoch = uuid::Uuid::new_v4().to_string();
+        let _ = self
+            .frame_tx
+            .send(binding.message(client.as_ref()).to_string());
         // A cached frame still carries the previous dimensions. Clear it while
         // holding the viewport locks so an in-flight CDP frame either publishes
         // before this invalidation or observes the new dimensions and is dropped.
@@ -334,7 +387,10 @@ impl StreamServer {
         let client_count = Arc::new(Mutex::new(0usize));
         let client_notify = Arc::new(Notify::new());
         let screencasting = Arc::new(Mutex::new(false));
-        let cdp_session_id = Arc::new(RwLock::new(None::<String>));
+        let cdp_session_id = Arc::new(RwLock::new(StreamBinding::new(
+            None,
+            client_slot.read().await.as_ref(),
+        )));
         let viewport_width = Arc::new(Mutex::new(1280u32));
         let viewport_height = Arc::new(Mutex::new(720u32));
         let last_tabs = Arc::new(RwLock::new(Vec::<Value>::new()));
@@ -448,6 +504,7 @@ impl StreamServer {
     /// never held for an ack.
     pub fn broadcast_frame(&self, frame_json: &str) {
         self.frame_watch.send_replace(Some(Arc::new(StreamFrame {
+            binding_epoch: None,
             seq: seq_in_serialized_frame(frame_json),
             json: frame_json.to_string(),
         })));
@@ -471,6 +528,7 @@ impl StreamServer {
             }
         });
         self.frame_watch.send_replace(Some(Arc::new(StreamFrame {
+            binding_epoch: None,
             seq: Some(seq),
             json: msg.to_string(),
         })));
@@ -592,15 +650,19 @@ impl StreamServer {
         session_id: Option<String>,
         tabs: &[Value],
     ) {
+        // Lock order matches input and frame publication: client, binding, tabs.
+        let client_guard = self.client_slot.read().await;
         let mut session_guard = self.cdp_session_id.write().await;
         let mut tabs_guard = self.last_tabs.write().await;
-        let session_changed = *session_guard != session_id;
-        *session_guard = session_id;
+        let session_changed = session_guard.rebind(session_id, client_guard.as_ref());
         *tabs_guard = tabs.to_vec();
         // New WebSocket clients seed themselves from the frame watch before
         // they notify the CDP loop. Never let that seed belong to another tab.
         if session_changed {
             self.frame_watch.send_replace(None);
+            let _ = self
+                .frame_tx
+                .send(session_guard.message(client_guard.as_ref()).to_string());
         }
         let msg = json!({
             "type": "tabs",

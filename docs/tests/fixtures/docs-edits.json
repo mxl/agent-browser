@@ -1,5 +1,23 @@
 {
   "pages": {
+    "/streaming": [
+      {
+        "from": "\"type\": \"frame\",",
+        "to": "\"type\": \"frame\",\n  \"bindingEpoch\": \"<server-uuid>\","
+      },
+      {
+        "from": "\"type\": \"input_mouse\",",
+        "to": "\"type\": \"input_mouse\",\n  \"bindingEpoch\": \"<drawn-frame-epoch>\","
+      },
+      {
+        "from": "\"type\": \"input_keyboard\",",
+        "to": "\"type\": \"input_keyboard\",\n  \"bindingEpoch\": \"<drawn-frame-epoch>\","
+      },
+      {
+        "from": "\"type\": \"input_touch\",",
+        "to": "\"type\": \"input_touch\",\n  \"bindingEpoch\": \"<drawn-frame-epoch>\","
+      }
+    ],
     "/commands": [
       {
         "from": "# Trust a CA for locally launched Chromium on Linux",

@@ -83,12 +83,12 @@ async fn seed_main_frame_id(
 async fn publish_url(
     frame_tx: &broadcast::Sender<String>,
     last_tabs: &RwLock<Vec<Value>>,
-    cdp_session_id: &RwLock<Option<String>>,
+    cdp_session_id: &RwLock<super::StreamBinding>,
     event_session_id: Option<&str>,
     url: &str,
 ) {
     let active_session = cdp_session_id.read().await;
-    if !session_matches(active_session.as_deref(), event_session_id) {
+    if !session_matches(active_session.session_id.as_deref(), event_session_id) {
         return;
     }
     {
@@ -148,7 +148,7 @@ pub(super) async fn cdp_event_loop(
     client_notify: Arc<tokio::sync::Notify>,
     screencasting: Arc<Mutex<bool>>,
     client_count: Arc<Mutex<usize>>,
-    cdp_session_id: Arc<RwLock<Option<String>>>,
+    cdp_session_id: Arc<RwLock<super::StreamBinding>>,
     viewport_width: Arc<Mutex<u32>>,
     viewport_height: Arc<Mutex<u32>>,
     last_tabs: Arc<RwLock<Vec<Value>>>,
@@ -164,7 +164,7 @@ pub(super) async fn cdp_event_loop(
         tokio::select! {
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
-                    let session_id = cdp_session_id.read().await.clone();
+                    let session_id = cdp_session_id.read().await.session_id.clone();
                     if *screencasting.lock().await {
                         if let Some(ref client) = *client_slot.read().await {
                             let _ = client
@@ -192,9 +192,11 @@ pub(super) async fn cdp_event_loop(
                     _ => (client.subscribe(), VecDeque::new()),
                 };
                 let client_arc = Arc::clone(client);
+                let binding = cdp_session_id.read().await;
+                let session_id = binding.session_id.clone();
+                let loop_epoch = binding.epoch_for(Some(client)).map(String::from);
+                drop(binding);
                 drop(guard);
-
-                let session_id = cdp_session_id.read().await.clone();
 
                 let vw = *viewport_width.lock().await;
                 let vh = *viewport_height.lock().await;
@@ -289,7 +291,7 @@ pub(super) async fn cdp_event_loop(
                         changed = shutdown_rx.changed() => {
                             if changed.is_err() || *shutdown_rx.borrow() {
                                 if supports_screencast {
-                                    let session_id = cdp_session_id.read().await.clone();
+                                    let session_id = cdp_session_id.read().await.session_id.clone();
                                     let _ = client_arc
                                         .send_command_no_params("Page.stopScreencast", session_id.as_deref())
                                         .await;
@@ -301,7 +303,7 @@ pub(super) async fn cdp_event_loop(
                         }
                         _ = client_notify.notified() => {
                             let count = *client_count.lock().await;
-                            let new_session_id = cdp_session_id.read().await.clone();
+                            let new_session_id = cdp_session_id.read().await.session_id.clone();
                             if count == 0 {
                                 if supports_screencast {
                                     let _ = client_arc
@@ -319,7 +321,8 @@ pub(super) async fn cdp_event_loop(
                                     .is_some_and(|c| Arc::ptr_eq(c, &client_arc));
                                 !same
                             };
-                            let session_changed = new_session_id != session_id;
+                            let epoch_changed = cdp_session_id.read().await.epoch_for(Some(&client_arc)) != loop_epoch.as_deref();
+                            let session_changed = new_session_id != session_id || epoch_changed;
                             let new_vw = *viewport_width.lock().await;
                             let new_vh = *viewport_height.lock().await;
                             let viewport_changed = new_vw != vw || new_vh != vh;
@@ -444,7 +447,7 @@ pub(super) async fn cdp_event_loop(
                                         let matches_bound_session = {
                                             let active_session = cdp_session_id.read().await;
                                             session_matches(
-                                                active_session.as_deref(),
+                                                active_session.session_id.as_deref(),
                                                 evt.session_id.as_deref(),
                                             )
                                         };
@@ -462,7 +465,7 @@ pub(super) async fn cdp_event_loop(
                                         if let Some(data) = evt.params.get("data").and_then(|v| v.as_str()) {
                                             let meta = evt.params.get("metadata");
                                             let seq = super::next_frame_seq();
-                                            let msg = json!({
+                                            let mut msg = json!({
                                                 "type": "frame",
                                                 "seq": seq,
                                                 "data": data,
@@ -482,8 +485,10 @@ pub(super) async fn cdp_event_loop(
                                             let active_vw = viewport_width.lock().await;
                                             let active_vh = viewport_height.lock().await;
                                             let frame_is_current = same_client
+                                                && loop_epoch.is_some()
+                                                && active_session.epoch_for(Some(&client_arc)) == loop_epoch.as_deref()
                                                 && session_matches(
-                                                    active_session.as_deref(),
+                                                    active_session.session_id.as_deref(),
                                                     evt.session_id.as_deref(),
                                                 )
                                                 && *active_vw == vw
@@ -491,8 +496,10 @@ pub(super) async fn cdp_event_loop(
                                             if !frame_is_current {
                                                 continue;
                                             }
+                                            msg["bindingEpoch"] = json!(loop_epoch);
                                             frame_watch.send_replace(Some(Arc::new(
                                                 super::StreamFrame {
+                                                    binding_epoch: loop_epoch.clone(),
                                                     seq: Some(seq),
                                                     json: msg.to_string(),
                                                 },
@@ -559,7 +566,7 @@ pub(super) async fn cdp_event_loop(
             let was_screencasting = *screencasting.lock().await;
             if was_screencasting {
                 if let Some(ref client) = *guard {
-                    let session_id = cdp_session_id.read().await.clone();
+                    let session_id = cdp_session_id.read().await.session_id.clone();
                     let _ = client
                         .send_command_no_params("Page.stopScreencast", session_id.as_deref())
                         .await;
@@ -831,7 +838,7 @@ mod tests {
         messages: broadcast::Receiver<String>,
         frames: watch::Receiver<Option<Arc<super::super::StreamFrame>>>,
         last_tabs: Arc<RwLock<Vec<Value>>>,
-        cdp_session_id: Arc<RwLock<Option<String>>>,
+        cdp_session_id: Arc<RwLock<super::super::StreamBinding>>,
         viewport_width: Arc<Mutex<u32>>,
         client_notify: Arc<tokio::sync::Notify>,
         shutdown: watch::Sender<bool>,
@@ -869,7 +876,10 @@ mod tests {
         let client_slot = Arc::new(RwLock::new(Some(client)));
         let client_notify = Arc::new(tokio::sync::Notify::new());
         let client_count = Arc::new(Mutex::new(1));
-        let cdp_session_id = Arc::new(RwLock::new(active_session.map(String::from)));
+        let cdp_session_id = Arc::new(RwLock::new(super::super::StreamBinding::new(
+            active_session.map(String::from),
+            client_slot.read().await.as_ref(),
+        )));
         let viewport_width = Arc::new(Mutex::new(1280));
         let last_tabs = Arc::new(RwLock::new(vec![
             json!({ "tabId": "t1", "url": "https://active.test/", "active": true }),
@@ -985,6 +995,12 @@ mod tests {
             .expect("test frame should be cached");
         let payload: Value = serde_json::from_str(&frame.json).unwrap();
         assert_eq!(payload["data"], data);
+        let binding = harness.cdp_session_id.read().await;
+        assert_eq!(
+            payload["bindingEpoch"].as_str(),
+            Some(binding.epoch.as_str())
+        );
+        assert_eq!(frame.binding_epoch.as_deref(), Some(binding.epoch.as_str()));
     }
 
     #[test]
@@ -1169,7 +1185,8 @@ mod tests {
         {
             let mut session = harness.cdp_session_id.write().await;
             let mut tabs = harness.last_tabs.write().await;
-            *session = Some("S-NEW".to_string());
+            session.session_id = Some("S-NEW".to_string());
+            session.epoch = uuid::Uuid::new_v4().to_string();
             *tabs = vec![
                 json!({ "tabId": "t1", "url": "https://old.test/", "active": false }),
                 json!({ "tabId": "t2", "url": "https://new.test/", "active": true }),
@@ -1203,7 +1220,11 @@ mod tests {
         let mut harness = start_loop(Some("S-OLD"), "F-OLD").await;
         next_message_of_type(&mut harness.messages, "status").await;
 
-        *harness.cdp_session_id.write().await = Some("S-NEW".to_string());
+        {
+            let mut binding = harness.cdp_session_id.write().await;
+            binding.session_id = Some("S-NEW".to_string());
+            binding.epoch = uuid::Uuid::new_v4().to_string();
+        }
         harness
             .events
             .send(json!({
@@ -1245,7 +1266,11 @@ mod tests {
         next_message_of_type(&mut harness.messages, "status").await;
         publish_frame_and_wait(&mut harness, "S-OLD", 6, "previous-tab-frame").await;
 
-        *harness.cdp_session_id.write().await = Some("S-NEW".to_string());
+        {
+            let mut binding = harness.cdp_session_id.write().await;
+            binding.session_id = Some("S-NEW".to_string());
+            binding.epoch = uuid::Uuid::new_v4().to_string();
+        }
         harness.client_notify.notify_one();
         wait_for_method(&harness.methods, "Page.stopScreencast").await;
         harness
@@ -1506,7 +1531,10 @@ mod tests {
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
             Arc::new(Mutex::new(1)),
-            Arc::new(RwLock::new(Some("S-ACTIVE".to_string()))),
+            Arc::new(RwLock::new(super::super::StreamBinding::new(
+                Some("S-ACTIVE".to_string()),
+                Some(&client),
+            ))),
             Arc::new(Mutex::new(1280)),
             Arc::new(Mutex::new(720)),
             Arc::new(RwLock::new(Vec::new())),

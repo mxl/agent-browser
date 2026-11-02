@@ -6,7 +6,7 @@ import { ArrowLeft, ArrowRight, Camera, Circle, FileCode, Maximize, Moon, Rotate
 import { cn } from "@/lib/utils";
 import { execCommand, sessionArgs } from "@/lib/exec";
 import { getSessionStreamUrl } from "@/lib/dashboard-routes";
-import { frameCanvasLayout, validFrameGeometry, viewportPoint, type FrameGeometry } from "@/lib/viewport-input";
+import { CanvasInputState, frameCanvasLayout, validFrameGeometry, viewportPoint } from "@/lib/viewport-input";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import {
@@ -33,6 +33,8 @@ import {
 import { Button } from "@/components/ui/button";
 import {
   currentFrameAtom,
+  bindingEpochAtom,
+  streamConnectedAtom,
   viewportWidthAtom,
   viewportHeightAtom,
   browserConnectedAtom,
@@ -156,10 +158,18 @@ export function Viewport() {
   const url = useAtomValue(activeUrlAtom);
   const sessionName = useAtomValue(activeSessionNameAtom);
   const streamPort = useAtomValue(activePortAtom);
-  const sendInput = useSetAtom(sendInputAtom);
+  const sendStreamInput = useSetAtom(sendInputAtom);
+  const bindingEpoch = useAtomValue(bindingEpochAtom);
+  const streamConnected = useAtomValue(streamConnectedAtom);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const drawnGeometryRef = useRef<FrameGeometry | null>(null);
+  const inputStateRef = useRef(new CanvasInputState());
+  const sendInput = useCallback((message: Record<string, unknown>) => {
+    const state = inputStateRef.current;
+    const bound = state.boundMessage(message);
+    if (!bound || !sendStreamInput(bound)) return false;
+    return true;
+  }, [sendStreamInput]);
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasAreaRef = useRef<HTMLDivElement>(null);
   const addressRef = useRef<HTMLInputElement>(null);
@@ -236,22 +246,28 @@ export function Viewport() {
   }, [addressValue, navigating, runCmd, url]);
 
   useEffect(() => {
-    drawnGeometryRef.current = null;
-    const canvas = canvasRef.current;
-    if (canvas) canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
+    inputStateRef.current.bind(null);
   }, [sessionName, streamPort]);
 
   useEffect(() => {
+    if (inputStateRef.current.bind(streamConnected ? bindingEpoch : null)) {
+      const canvas = canvasRef.current;
+      if (canvas) canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
+    }
+  }, [bindingEpoch, streamConnected, sessionName, streamPort]);
+
+  useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !frame || !validFrameGeometry(frame.metadata)) return;
+    if (!canvas || !frame || !validFrameGeometry(frame.metadata) ||
+      !inputStateRef.current.canDraw(frame.bindingEpoch)) return;
     let cancelled = false;
     const bin = atob(frame.data);
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
 
     createImageBitmap(new Blob([bytes], { type: "image/jpeg" })).then((bmp) => {
-      // Geometry changes only when its pixels are drawn. Ignore stale decodes.
-      if (!cancelled) {
+      // A decode for an older frame/session must not replace newer pixels.
+      if (!cancelled && inputStateRef.current.canDraw(frame.bindingEpoch)) {
         const meta = frame.metadata;
         const layout = frameCanvasLayout(bmp.width, meta);
         canvas.width = layout.width;
@@ -259,13 +275,13 @@ export function Viewport() {
         const ctx = canvas.getContext("2d");
         if (ctx) {
           ctx.drawImage(bmp, 0, layout.imageY);
-          drawnGeometryRef.current = meta;
+          inputStateRef.current.didDraw(frame.bindingEpoch, meta);
         }
       }
       bmp.close();
     }).catch(() => {});
     return () => { cancelled = true; };
-  }, [frame, sessionName, streamPort]);
+  }, [frame, bindingEpoch, streamConnected, sessionName, streamPort]);
 
   const isFit =
     canvasArea.width > 0 &&
@@ -343,7 +359,7 @@ export function Viewport() {
   const toViewport = useCallback(
     (e: React.MouseEvent): { x: number; y: number } | null => {
       const canvas = canvasRef.current;
-      const meta = drawnGeometryRef.current;
+      const meta = inputStateRef.current.drawn?.geometry;
       if (!canvas || !meta) return null;
       return viewportPoint(e.clientX, e.clientY, canvas.getBoundingClientRect(), meta);
     },

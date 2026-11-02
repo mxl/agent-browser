@@ -10255,12 +10255,27 @@ async fn e2e_stream_click_is_not_queued_behind_a_mouse_sweep() {
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
         .await
         .expect("websocket client should connect to runtime stream");
-    let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await;
+    // Input is authorized by the frame a renderer would finish drawing, not
+    // merely by the connection's opening binding or status message.
+    let binding_epoch = tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let message: Value = serde_json::from_str(&text).expect("valid stream JSON");
+            if message["type"] == "frame" {
+                if let Some(epoch) = message["bindingEpoch"].as_str() {
+                    return epoch.to_string();
+                }
+            }
+        }
+        panic!("stream ended before a bound frame");
+    })
+    .await
+    .expect("stream should publish a bound frame");
 
     // A sweep of moves, then the click that must not wait for them.
     for i in 0..300 {
         let mv = json!({
             "type": "input_mouse", "eventType": "mouseMoved",
+            "bindingEpoch": binding_epoch,
             "x": 100 + (i % 400), "y": 100 + (i % 300),
             "button": "none", "clickCount": 0
         });
@@ -10275,6 +10290,7 @@ async fn e2e_stream_click_is_not_queued_behind_a_mouse_sweep() {
     for event in ["mousePressed", "mouseReleased"] {
         let click = json!({
             "type": "input_mouse", "eventType": event,
+            "bindingEpoch": binding_epoch,
             "x": 200, "y": 200, "button": "left", "clickCount": 1
         });
         ws.send(Message::Text(click.to_string()))
