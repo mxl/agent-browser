@@ -3327,6 +3327,9 @@ including its top offset, rather than configured viewport or JPEG dimensions.
 WebSocket mouse, keyboard, and touch messages must echo the drawn frame's
 bindingEpoch. Binding changes and reconnects invalidate old input state.
 The epoch identifies a target binding, not a document navigation.
+Focus the live canvas for native plain-text paste (up to 64 KiB UTF-8).
+Paste inserts text, not HTML/images or the remote clipboard. Empty and
+oversized payloads are rejected. Blur releases keys with their original epoch.
 These WebSocket behaviors add no CLI command or MCP tool.
 
 Subcommands:

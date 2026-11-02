@@ -6,7 +6,7 @@ import { ArrowLeft, ArrowRight, Camera, Circle, FileCode, Maximize, Moon, Rotate
 import { cn } from "@/lib/utils";
 import { execCommand, sessionArgs } from "@/lib/exec";
 import { getSessionStreamUrl } from "@/lib/dashboard-routes";
-import { CanvasInputState, frameCanvasLayout, validFrameGeometry, viewportPoint } from "@/lib/viewport-input";
+import { CanvasInputState, forwardCanvasKey, frameCanvasLayout, inputTextMessage, keyboardMessage, validFrameGeometry, viewportPoint } from "@/lib/viewport-input";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import {
@@ -55,45 +55,6 @@ function cdpModifiers(e: React.MouseEvent | React.WheelEvent): number {
   if (e.metaKey) m |= 4;
   if (e.shiftKey) m |= 8;
   return m;
-}
-
-const KEY_INFO: Record<string, { text?: string; keyCode: number }> = {
-  Enter: { text: "\r", keyCode: 13 },
-  Tab: { text: "\t", keyCode: 9 },
-  Backspace: { text: "\b", keyCode: 8 },
-  Escape: { keyCode: 27 },
-  ArrowLeft: { keyCode: 37 },
-  ArrowUp: { keyCode: 38 },
-  ArrowRight: { keyCode: 39 },
-  ArrowDown: { keyCode: 40 },
-  Delete: { keyCode: 46 },
-  Home: { keyCode: 36 },
-  End: { keyCode: 35 },
-  PageUp: { keyCode: 33 },
-  PageDown: { keyCode: 34 },
-};
-
-function printableKeyCode(key: string): number {
-  if (key.length !== 1) return 0;
-  const code = key.charCodeAt(0);
-  if (code >= 65 && code <= 90) return code;
-  if (code >= 97 && code <= 122) return code - 32;
-  if (code >= 48 && code <= 57) return code;
-  switch (key) {
-    case " ": return 32;
-    case ";": case ":": return 186;
-    case "=": case "+": return 187;
-    case ",": case "<": return 188;
-    case "-": case "_": return 189;
-    case ".": case ">": return 190;
-    case "/": case "?": return 191;
-    case "`": case "~": return 192;
-    case "[": case "{": return 219;
-    case "\\": case "|": return 220;
-    case "]": case "}": return 221;
-    case "'": case "\"": return 222;
-    default: return 0;
-  }
 }
 
 function cdpButton(btn: number): string {
@@ -168,6 +129,7 @@ export function Viewport() {
     const state = inputStateRef.current;
     const bound = state.boundMessage(message);
     if (!bound || !sendStreamInput(bound)) return false;
+    state.sent(bound);
     return true;
   }, [sendStreamInput]);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -402,45 +364,42 @@ export function Viewport() {
     [toViewport, sendInput],
   );
 
-  const dispatchKey = useCallback(
-    (e: KeyboardEvent, eventType: string) => {
-      const info = KEY_INFO[e.key];
-      const text = eventType === "keyDown"
-        ? (info?.text ?? (Array.from(e.key).length === 1 ? e.key : undefined))
-        : undefined;
-      const keyCode = info?.keyCode ?? printableKeyCode(e.key);
-      let m = 0;
-      if (e.altKey) m |= 1;
-      if (e.ctrlKey) m |= 2;
-      if (e.metaKey) m |= 4;
-      if (e.shiftKey) m |= 8;
-      sendInput({
-        type: "input_keyboard",
-        eventType,
-        key: e.key,
-        code: e.code,
-        text,
-        windowsVirtualKeyCode: keyCode,
-        modifiers: m,
-      });
-    },
-    [sendInput],
-  );
+  const releaseKeys = useCallback(() => {
+    inputStateRef.current.releaseKeys(sendStreamInput);
+  }, [sendStreamInput]);
 
   useEffect(() => {
+    const pasteKeys = inputStateRef.current.pasteKeys;
     const handler = (e: KeyboardEvent) => {
+      if (document.activeElement !== canvasRef.current) return;
+      e.stopPropagation();
+      // Do not cancel native paste keydown: the resulting paste event is the
+      // sole, user-initiated source of clipboard text. No clipboard API reads.
+      if (!forwardCanvasKey(e, pasteKeys)) return;
+      e.preventDefault();
+      sendInput(keyboardMessage(e, e.type === "keydown" ? "keyDown" : "keyUp"));
+    };
+    // Capture on document because a native paste may target body rather than
+    // a non-editable canvas. Canvas focus is still required; no clipboard reads.
+    const paste = (e: ClipboardEvent) => {
       if (document.activeElement !== canvasRef.current) return;
       e.preventDefault();
       e.stopPropagation();
-      dispatchKey(e, e.type === "keydown" ? "keyDown" : "keyUp");
+      const message = inputTextMessage(e.clipboardData?.getData("text/plain") ?? "");
+      if (message) sendInput(message);
     };
     window.addEventListener("keydown", handler, true);
     window.addEventListener("keyup", handler, true);
+    window.addEventListener("blur", releaseKeys);
+    document.addEventListener("paste", paste, true);
     return () => {
+      releaseKeys();
       window.removeEventListener("keydown", handler, true);
       window.removeEventListener("keyup", handler, true);
+      window.removeEventListener("blur", releaseKeys);
+      document.removeEventListener("paste", paste, true);
     };
-  }, [dispatchKey]);
+  }, [sendInput, releaseKeys, sessionName, streamPort]);
 
   return (
     <div ref={containerRef} className="flex h-full flex-col">
@@ -558,6 +517,7 @@ export function Viewport() {
           <canvas
             ref={canvasRef}
             tabIndex={0}
+            onBlur={releaseKeys}
             className="max-h-full max-w-full object-contain outline-none"
             onMouseMove={(e) => handleMouseEvent(e, "mouseMoved")}
             onMouseDown={(e) => {

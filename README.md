@@ -1158,6 +1158,8 @@ Monitor agent-browser sessions in real time with a local web dashboard showing a
 
 Dashboard pointer input uses the geometry of the frame drawn on the canvas, including Chrome's top offset and device-independent dimensions. Encoded image size and local display scaling do not change browser input coordinates. These are WebSocket rendering and input behaviors, not additional CLI commands or MCP tools.
 
+Focus the live canvas to paste plain text with your browser's native paste shortcut. The dashboard forwards only the user-initiated `text/plain` paste payload, up to 64 KiB of UTF-8, through CDP `Input.insertText`; it does not read the clipboard API, transfer HTML/images, or change the remote clipboard. Empty or oversized text is rejected, not truncated. Paste shortcuts are not also sent as remote keystrokes. Ordinary keys preserve Unicode text while physical key codes, numpad keys, and modifier shortcuts remain distinct. Canvas/window blur releases tracked keys with their original binding epoch; rebinding discards old key state rather than releasing into another target.
+
 ```bash
 # Start the dashboard server (runs in background on port 4848)
 agent-browser dashboard start
@@ -1758,6 +1760,18 @@ On Chrome, URL messages follow full-document, History API, and fragment navigati
   "clickCount": 1
 }
 ```
+
+**Insert plain text:**
+
+```json
+{
+  "type": "input_text",
+  "bindingEpoch": "<drawn-frame-epoch>",
+  "text": "line 1\nline 2"
+}
+```
+
+`input_text` accepts exactly `type`, `bindingEpoch`, and a nonempty `text` string of at most 65,536 UTF-8 bytes. Unknown fields and client-selected session/target routing are rejected. Accepted text resets the daemon idle timer and is inserted without waiting for a CDP reply.
 
 **Send keyboard events:**
 

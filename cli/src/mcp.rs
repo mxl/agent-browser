@@ -3913,7 +3913,8 @@ fn dashboard_start_args(arguments: &Value) -> Result<Vec<String>, ProtocolError>
     Ok(args)
 }
 
-// Canvas geometry and binding epochs are WebSocket concerns, not separate MCP tools.
+// Canvas geometry, binding epochs, and plain-text paste are WebSocket concerns.
+// There is no dedicated CLI/MCP input_text tool; paste belongs to canvas focus.
 // Keep dashboard startup delegated through the canonical CLI parser.
 fn call_dashboard_start(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, dashboard_start_args(arguments)?, None)

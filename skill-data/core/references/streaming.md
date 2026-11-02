@@ -83,12 +83,17 @@ These messages belong to the WebSocket protocol. They have no dedicated CLI comm
 {"type": "input_mouse", "bindingEpoch": "<drawn-frame-epoch>", "eventType": "mousePressed", "x": 40, "y": 40, "button": "left", "clickCount": 1}
 {"type": "input_keyboard", "bindingEpoch": "<drawn-frame-epoch>", "eventType": "keyDown", "key": "a", "text": "a"}
 {"type": "input_touch", "bindingEpoch": "<drawn-frame-epoch>", "eventType": "touchStart", "touchPoints": []}
+{"type": "input_text", "bindingEpoch": "<drawn-frame-epoch>", "text": "line 1\nline 2"}
 {"type": "config", "maxFps": 10}
 {"type": "config", "pacing": "ack"}
 {"type": "ack", "seq": 41}
 ```
 
 Input dispatches to the browser on a task of its own, separate from frame delivery, so a click is not queued behind a frame write. Events are sent to the browser without waiting for its reply, so a click stays responsive behind a burst of mouse moves. Ordering is preserved: press never overtakes move. Mouse, keyboard, and touch input also reset the daemon idle timer, so an actively driven preview is not shut down by the idle timeout.
+
+`input_text` accepts exactly three fields: `type: "input_text"`, the drawn frame's `bindingEpoch`, and a nonempty `text` string of at most 65,536 UTF-8 bytes. Invalid, oversized, or extra-field payloads are rejected without activity tracking. Accepted text resets the idle timer and dispatches CDP `Input.insertText` without waiting for a reply. It inserts text, not HTML or images, and does not update the remote clipboard.
+
+The dashboard listens for user-initiated document paste only while the live canvas has focus. Ctrl/Meta+V and Shift+Insert stay native and are suppressed remotely, including their matching keyup. No clipboard API read is performed. Unicode codepoints retain their text; physical, numpad, and modifier keys use distinct key codes. Blur releases tracked keys using their originating binding; rebinding drops old key state rather than sending releases to another target.
 
 `config` sets a per-client frame cap: 1 to 120, or `0` for uncapped (the default). It takes effect immediately, including when it loosens the cap. Each client's cap is its own; other connected clients are unaffected. A value above 120 is clamped to 120; a negative or non-numeric value is ignored, leaving the current cap in place. Neither rejects the connection.
 

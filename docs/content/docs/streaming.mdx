@@ -266,6 +266,20 @@ Send input events to control the browser remotely. Mouse, keyboard, and touch in
 }
 ```
 
+### Plain-text insertion
+
+```json
+{
+  "type": "input_text",
+  "bindingEpoch": "<drawn-frame-epoch>",
+  "text": "line 1\nline 2"
+}
+```
+
+This message accepts exactly `type`, `bindingEpoch`, and `text`. Text must be a nonempty string of at most 65,536 UTF-8 bytes; extra fields, wrong types, empty text, and oversized payloads are rejected, not truncated. Accepted text resets the idle timer and uses CDP `Input.insertText` without waiting for a reply. It does not insert HTML/images or update the remote clipboard.
+
+The dashboard forwards user-initiated document paste only while the live canvas has focus, using `text/plain` without clipboard API reads. Ctrl/Meta+V and Shift+Insert stay native; neither the paste keydown nor its matching keyup is sent remotely. Ordinary Unicode codepoints retain their text, physical and numpad keys use distinct codes, and modifier shortcuts send no printable text. Canvas/window blur releases tracked keys with their originating epoch. A rebind clears old key state rather than releasing into another target.
+
 ### Touch events
 
 ```json
