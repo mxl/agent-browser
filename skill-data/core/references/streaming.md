@@ -45,11 +45,13 @@ Connect a WebSocket client to `ws://127.0.0.1:<port>`. Frame delivery starts aut
 
 Every message is JSON text with a `type` field.
 
+- `binding`: `{"type":"binding","bindingEpoch":"<server-uuid>"}` announces the current Chrome input binding; a null epoch disables input. Clear drawn input state on changes or reconnect.
 - `frame`: a viewport image plus its metadata. Delivered latest-first (see below).
 
 ```json
 {
   "type": "frame",
+  "bindingEpoch": "<server-uuid>",
   "seq": 41,
   "data": "<base64-encoded-jpeg>",
   "metadata": {
@@ -73,12 +75,14 @@ Frame geometry comes from CDP; configured viewport dimensions are only fallbacks
 
 ## Messages from the client
 
+Echo `bindingEpoch` from the frame you finished drawing in every mouse, keyboard, and touch message. The server validates the epoch and sends input under the same client/binding guards, so a queued event cannot move to a newly bound target. Missing or stale epochs and client-supplied session/target routing are rejected. Do not stamp the latest binding onto old pixels. The epoch identifies a client and target binding, not a document; same-target navigation does not rotate it, and old-target held-key cleanup is not guaranteed.
+
 These messages belong to the WebSocket protocol. They have no dedicated CLI command or MCP tool; existing CLI and MCP parser delegation is unchanged.
 
 ```json
-{"type": "input_mouse", "eventType": "mousePressed", "x": 40, "y": 40, "button": "left", "clickCount": 1}
-{"type": "input_keyboard", "eventType": "keyDown", "key": "a", "text": "a"}
-{"type": "input_touch", "eventType": "touchStart", "touchPoints": []}
+{"type": "input_mouse", "bindingEpoch": "<drawn-frame-epoch>", "eventType": "mousePressed", "x": 40, "y": 40, "button": "left", "clickCount": 1}
+{"type": "input_keyboard", "bindingEpoch": "<drawn-frame-epoch>", "eventType": "keyDown", "key": "a", "text": "a"}
+{"type": "input_touch", "bindingEpoch": "<drawn-frame-epoch>", "eventType": "touchStart", "touchPoints": []}
 {"type": "config", "maxFps": 10}
 {"type": "config", "pacing": "ack"}
 {"type": "ack", "seq": 41}

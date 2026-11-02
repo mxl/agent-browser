@@ -1707,11 +1707,16 @@ The WebSocket server streams the browser viewport and accepts input events.
 
 Connect to `ws://localhost:9223` to receive frames and send input:
 
+The server sends `{"type":"binding","bindingEpoch":"<server-uuid>"}` before current Chrome frames. Each frame carries the same `bindingEpoch`. Echo the epoch from the frame you finished drawing in every mouse, keyboard, or touch message. Clear displayed input state on binding changes or reconnect; never attach a new epoch to old pixels. Input without the current epoch, or with client-supplied target/session routing, is ignored.
+
+The epoch identifies the CDP client and target binding, not the document. Navigation within the same target does not rotate it, and cleanup of held keys in an old target is not guaranteed.
+
 **Receive frames:**
 
 ```json
 {
   "type": "frame",
+  "bindingEpoch": "<server-uuid>",
   "seq": 41,
   "data": "<base64-encoded-jpeg>",
   "metadata": {
@@ -1745,6 +1750,7 @@ On Chrome, URL messages follow full-document, History API, and fragment navigati
 ```json
 {
   "type": "input_mouse",
+  "bindingEpoch": "<drawn-frame-epoch>",
   "eventType": "mousePressed",
   "x": 100,
   "y": 200,
@@ -1758,6 +1764,7 @@ On Chrome, URL messages follow full-document, History API, and fragment navigati
 ```json
 {
   "type": "input_keyboard",
+  "bindingEpoch": "<drawn-frame-epoch>",
   "eventType": "keyDown",
   "key": "Enter",
   "code": "Enter"

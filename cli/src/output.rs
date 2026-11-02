@@ -3324,7 +3324,10 @@ browser viewports and command activity feeds for all sessions.
 The dashboard is bundled into the binary and requires no separate install.
 Canvas pointer input uses the drawn frame's device-independent geometry,
 including its top offset, rather than configured viewport or JPEG dimensions.
-This WebSocket behavior adds no CLI command or MCP tool.
+WebSocket mouse, keyboard, and touch messages must echo the drawn frame's
+bindingEpoch. Binding changes and reconnects invalidate old input state.
+The epoch identifies a target binding, not a document navigation.
+These WebSocket behaviors add no CLI command or MCP tool.
 
 Subcommands:
   start [--port <n>] [--allowed-origins <origins>]

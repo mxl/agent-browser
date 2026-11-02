@@ -134,7 +134,7 @@ pub(super) async fn accept_loop(
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
     screencasting: Arc<Mutex<bool>>,
-    cdp_session_id: Arc<RwLock<Option<String>>>,
+    cdp_session_id: Arc<RwLock<super::StreamBinding>>,
     viewport_width: Arc<Mutex<u32>>,
     viewport_height: Arc<Mutex<u32>>,
     last_tabs: Arc<RwLock<Vec<Value>>>,
@@ -229,7 +229,7 @@ async fn handle_connection(
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
     screencasting: Arc<Mutex<bool>>,
-    cdp_session_id: Arc<RwLock<Option<String>>>,
+    cdp_session_id: Arc<RwLock<super::StreamBinding>>,
     viewport_width: Arc<Mutex<u32>>,
     viewport_height: Arc<Mutex<u32>>,
     last_tabs: Arc<RwLock<Vec<Value>>>,
@@ -289,7 +289,7 @@ async fn handle_ws_client(
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
     screencasting: Arc<Mutex<bool>>,
-    cdp_session_id: Arc<RwLock<Option<String>>>,
+    cdp_session_id: Arc<RwLock<super::StreamBinding>>,
     viewport_width: Arc<Mutex<u32>>,
     viewport_height: Arc<Mutex<u32>>,
     last_tabs: Arc<RwLock<Vec<Value>>>,
@@ -347,6 +347,10 @@ async fn handle_ws_client(
     {
         let guard = client_slot.read().await;
         let connected = guard.is_some();
+        // Seed identity before any cached pixels. Subsequent binding messages
+        // invalidate in-flight frames on clients; the server still checks sends.
+        let binding_message = cdp_session_id.read().await.message(guard.as_ref());
+        let _ = ws_tx.send(Message::Text(binding_message.to_string())).await;
         let sc = *screencasting.lock().await;
         let vw = *viewport_width.lock().await;
         let vh = *viewport_height.lock().await;
@@ -385,10 +389,15 @@ async fn handle_ws_client(
     // it. Charged against the cap, so a URL-declared cap governs the gap after.
     let initial_frame = frame_watch.borrow_and_update().clone();
     if let Some(frame) = initial_frame {
-        if ws_tx.send(Message::Text(frame.json.clone())).await.is_ok() {
-            last_sent = Some(Instant::now());
-            if initial_config.ack_pacing {
-                awaiting_ack = frame.seq;
+        if let Ok(prefix) = frame_binding_message(&frame, &client_slot, &cdp_session_id).await {
+            if let Some(prefix) = prefix {
+                let _ = ws_tx.send(Message::Text(prefix)).await;
+            }
+            if ws_tx.send(Message::Text(frame.json.clone())).await.is_ok() {
+                last_sent = Some(Instant::now());
+                if initial_config.ack_pacing {
+                    awaiting_ack = frame.seq;
+                }
             }
         }
     }
@@ -412,6 +421,17 @@ async fn handle_ws_client(
             msg = broadcast_rx.recv() => {
                 match msg {
                     Ok(data) => {
+                        // The latest frame may have overtaken queued controls.
+                        // Do not roll the frontend back to an obsolete binding.
+                        if let Ok(message) = serde_json::from_str::<Value>(&data) {
+                            if message.get("type").and_then(Value::as_str) == Some("binding") {
+                                let client = client_slot.read().await;
+                                let binding = cdp_session_id.read().await;
+                                if message.get("bindingEpoch").and_then(Value::as_str) != binding.epoch_for(client.as_ref()) {
+                                    continue;
+                                }
+                            }
+                        }
                         if ws_tx.send(Message::Text(data)).await.is_err() {
                             break;
                         }
@@ -464,6 +484,10 @@ async fn handle_ws_client(
                 pending_frame = false;
                 let cfg = *config_rx.borrow();
                 if let Some(frame) = frame {
+                    let Ok(prefix) = frame_binding_message(&frame, &client_slot, &cdp_session_id).await else { continue };
+                    if let Some(prefix) = prefix {
+                        if ws_tx.send(Message::Text(prefix)).await.is_err() { break; }
+                    }
                     if cfg.ack_pacing {
                         awaiting_ack = frame.seq;
                         // Settle against the banked watermark: a client that
@@ -492,13 +516,32 @@ async fn handle_ws_client(
     client_notify.notify_one();
 }
 
+/// Frame and broadcast channels are independently paced. Prefix a current
+/// frame with its SAME binding so the first/only new frame cannot overtake its
+/// invalidation message. Stale cached frames are skipped, never re-stamped.
+async fn frame_binding_message(
+    frame: &super::StreamFrame,
+    client_slot: &RwLock<Option<Arc<CdpClient>>>,
+    binding: &RwLock<super::StreamBinding>,
+) -> Result<Option<String>, ()> {
+    let Some(epoch) = frame.binding_epoch.as_deref() else {
+        return Ok(None);
+    };
+    let client = client_slot.read().await;
+    let current = binding.read().await;
+    if current.epoch_for(client.as_ref()) != Some(epoch) {
+        return Err(());
+    }
+    Ok(Some(current.message(client.as_ref()).to_string()))
+}
+
 /// Reads client messages and dispatches them without waiting on frame
 /// delivery. Input reaches CDP sequentially: mouse move, press and release
 /// must not be reordered.
 async fn reader_loop(
     mut ws_rx: SplitStream<WebSocketStream<TcpStream>>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
-    cdp_session_id: Arc<RwLock<Option<String>>>,
+    cdp_session_id: Arc<RwLock<super::StreamBinding>>,
     config: watch::Sender<ClientConfig>,
     ack: watch::Sender<u64>,
     idle_activity: Arc<IdleActivity>,
@@ -539,21 +582,56 @@ async fn reader_loop(
                     }
                     continue;
                 }
-                let guard = client_slot.read().await;
-                if let Some(ref client) = *guard {
-                    // Marked inside the guard: only input that reaches CDP
-                    // counts as activity.
-                    if is_user_input_message_type(msg_type) {
-                        idle_activity.mark();
-                    }
-                    let sid = cdp_session_id.read().await;
-                    dispatch_input(msg_type, &parsed, client.as_ref(), sid.as_deref()).await;
-                }
+                dispatch_bound_input(
+                    msg_type,
+                    &parsed,
+                    &client_slot,
+                    &cdp_session_id,
+                    &idle_activity,
+                )
+                .await;
             }
             Ok(Message::Close(_)) | Err(_) => break,
             _ => {}
         }
     }
+}
+
+/// Validation and send are inside the SAME client/binding read guards that
+/// exclude rebind writers. Never check a token and then reacquire a newer target.
+async fn dispatch_bound_input(
+    msg_type: &str,
+    parsed: &Value,
+    client_slot: &RwLock<Option<Arc<CdpClient>>>,
+    binding: &RwLock<super::StreamBinding>,
+    idle_activity: &IdleActivity,
+) {
+    if !is_user_input_message_type(msg_type) {
+        return;
+    }
+    let client_guard = client_slot.read().await;
+    let Some(client) = client_guard.as_ref() else {
+        return;
+    };
+    let binding_guard = binding.read().await;
+    let Some(epoch) = binding_guard.epoch_for(Some(client)) else {
+        return;
+    };
+    if parsed.get("bindingEpoch").and_then(Value::as_str) != Some(epoch)
+        || ["sessionId", "targetId", "session_id", "target_id"]
+            .iter()
+            .any(|key| parsed.get(key).is_some())
+    {
+        return;
+    }
+    idle_activity.mark();
+    dispatch_input(
+        msg_type,
+        parsed,
+        client,
+        binding_guard.session_id.as_deref(),
+    )
+    .await;
 }
 
 /// Aborts its task on drop.
@@ -680,6 +758,244 @@ mod tests {
         }
         assert!(!is_user_input_message_type("status"));
         assert!(!is_user_input_message_type("frame"));
+    }
+
+    #[tokio::test]
+    async fn test_stale_displayed_frame_input_is_rejected_across_binding_changes() {
+        let (url, seen) = silent_cdp_server().await;
+        let client = Arc::new(CdpClient::connect(&url).await.unwrap());
+        let activity = Arc::new(IdleActivity::new());
+        let (server, slot) = super::super::StreamServer::start_without_client(
+            0,
+            "epoch-test".into(),
+            false,
+            activity.clone(),
+        )
+        .await
+        .unwrap();
+        *slot.write().await = Some(client.clone());
+        server
+            .bind_cdp_session_and_broadcast_tabs(Some("A".into()), &[])
+            .await;
+        // This token represents a frame still visible/in flight on the client.
+        let displayed_a_epoch = server.cdp_session_id.read().await.epoch.clone();
+        let displayed_frame = super::super::StreamFrame {
+            binding_epoch: Some(displayed_a_epoch.clone()),
+            seq: Some(1),
+            json: "synthetic frame".into(),
+        };
+        let prefix = frame_binding_message(&displayed_frame, &slot, &server.cdp_session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&prefix).unwrap()["bindingEpoch"],
+            displayed_a_epoch
+        );
+        let input_a = json!({"type": "input_mouse", "bindingEpoch": displayed_a_epoch, "x": 1});
+        server
+            .bind_cdp_session_and_broadcast_tabs(Some("B".into()), &[])
+            .await;
+        let b_epoch = server.cdp_session_id.read().await.epoch.clone();
+        assert_ne!(displayed_a_epoch, b_epoch);
+        assert!(
+            frame_binding_message(&displayed_frame, &slot, &server.cdp_session_id)
+                .await
+                .is_err(),
+            "never refresh an old frame's epoch"
+        );
+        dispatch_bound_input(
+            "input_mouse",
+            &input_a,
+            &slot,
+            &server.cdp_session_id,
+            &activity,
+        )
+        .await;
+        // Stale mouse/keyboard (including blur releases) cannot go to B either.
+        for kind in ["input_mouse", "input_keyboard", "input_touch"] {
+            dispatch_bound_input(
+                kind,
+                &json!({"bindingEpoch": displayed_a_epoch, "eventType": "keyUp", "key": "Control"}),
+                &slot,
+                &server.cdp_session_id,
+                &activity,
+            )
+            .await;
+        }
+        let input_b = json!({"type": "input_mouse", "bindingEpoch": b_epoch, "x": 2});
+        dispatch_bound_input(
+            "input_mouse",
+            &input_b,
+            &slot,
+            &server.cdp_session_id,
+            &activity,
+        )
+        .await;
+        server
+            .bind_cdp_session_and_broadcast_tabs(Some("A".into()), &[])
+            .await;
+        let fresh_a_epoch = server.cdp_session_id.read().await.epoch.clone();
+        assert_ne!(
+            displayed_a_epoch, fresh_a_epoch,
+            "A->B->A must not reuse A's old token"
+        );
+        dispatch_bound_input(
+            "input_mouse",
+            &input_a,
+            &slot,
+            &server.cdp_session_id,
+            &activity,
+        )
+        .await;
+        let fresh = json!({"type": "input_mouse", "bindingEpoch": fresh_a_epoch, "x": 3});
+        dispatch_bound_input(
+            "input_mouse",
+            &fresh,
+            &slot,
+            &server.cdp_session_id,
+            &activity,
+        )
+        .await;
+        // A newly created server/binding never reuses an epoch, even for the
+        // same CDP client/session, so reconnecting old pixels fail closed.
+        let restarted = RwLock::new(super::super::StreamBinding::new(
+            Some("A".into()),
+            Some(&client),
+        ));
+        assert_ne!(restarted.read().await.epoch, fresh_a_epoch);
+        dispatch_bound_input("input_mouse", &fresh, &slot, &restarted, &activity).await;
+        // A marker after all attempted sends proves stale events sent nothing.
+        dispatch_bound_input(
+            "input_keyboard",
+            &json!({"bindingEpoch": fresh_a_epoch, "eventType": "keyUp", "key": "Shift"}),
+            &slot,
+            &server.cdp_session_id,
+            &activity,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while seen.lock().await.len() < 3 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let commands = seen.lock().await;
+        assert_eq!(commands.len(), 3, "no stale input may reach CDP");
+        assert_eq!(commands[0]["method"], "Input.dispatchMouseEvent");
+        assert_eq!(commands[0]["sessionId"], "B");
+        assert_eq!(commands[0]["params"]["x"], 2.0);
+        assert_eq!(commands[1]["sessionId"], "A");
+        assert_eq!(commands[1]["params"]["x"], 3.0);
+        assert_eq!(commands[2]["method"], "Input.dispatchKeyEvent");
+        drop(commands);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_input_waiting_behind_rebind_rechecks_epoch_under_binding_guard() {
+        let (url, seen) = silent_cdp_server().await;
+        let client = Arc::new(CdpClient::connect(&url).await.unwrap());
+        let slot = Arc::new(RwLock::new(Some(client.clone())));
+        let binding = Arc::new(RwLock::new(super::super::StreamBinding::new(
+            Some("A".into()),
+            Some(&client),
+        )));
+        let old_epoch = binding.read().await.epoch.clone();
+        let mut writer = binding.write().await;
+        let waiting_slot = slot.clone();
+        let waiting_binding = binding.clone();
+        let activity = Arc::new(IdleActivity::new());
+        let waiting_activity = activity.clone();
+        let queued = tokio::spawn(async move {
+            dispatch_bound_input(
+                "input_mouse",
+                &json!({"type": "input_mouse", "bindingEpoch": old_epoch, "x": 4}),
+                &waiting_slot,
+                &waiting_binding,
+                &waiting_activity,
+            )
+            .await;
+        });
+        // The old event is queued behind a writer, not merely checked against
+        // a client-side attribute. The send must validate the post-rebind state.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while slot.try_write().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("input must hold the client guard while waiting for binding");
+        writer.rebind(Some("B".into()), Some(&client));
+        let new_epoch = writer.epoch.clone();
+        drop(writer);
+        queued.await.unwrap();
+        dispatch_bound_input(
+            "input_mouse",
+            &json!({"type": "input_mouse", "bindingEpoch": new_epoch, "x": 5}),
+            &slot,
+            &binding,
+            &activity,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while seen.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let commands = seen.lock().await;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["sessionId"], "B");
+        assert_eq!(commands[0]["params"]["x"], 5.0);
+    }
+
+    #[tokio::test]
+    async fn test_client_replacement_gap_rejects_old_epoch_even_with_same_session_id() {
+        let (old_url, old_seen) = silent_cdp_server().await;
+        let (new_url, new_seen) = silent_cdp_server().await;
+        let old = Arc::new(CdpClient::connect(&old_url).await.unwrap());
+        let new = Arc::new(CdpClient::connect(&new_url).await.unwrap());
+        let slot = RwLock::new(Some(old.clone()));
+        let binding = RwLock::new(super::super::StreamBinding::new(
+            Some("same-session".into()),
+            Some(&old),
+        ));
+        let epoch = binding.read().await.epoch.clone();
+        let input = json!({"type": "input_mouse", "bindingEpoch": epoch, "x": 6});
+        let activity = IdleActivity::new();
+        // Models update_stream_client's gap between changing client_slot and
+        // rebinding the page session. An old token must authorize neither client.
+        *slot.write().await = Some(new.clone());
+        dispatch_bound_input("input_mouse", &input, &slot, &binding, &activity).await;
+        binding
+            .write()
+            .await
+            .rebind(Some("same-session".into()), Some(&new));
+        let fresh = binding.read().await.epoch.clone();
+        assert_ne!(epoch, fresh);
+        dispatch_bound_input("input_mouse", &input, &slot, &binding, &activity).await;
+        dispatch_bound_input(
+            "input_mouse",
+            &json!({"type": "input_mouse", "bindingEpoch": fresh, "x": 7}),
+            &slot,
+            &binding,
+            &activity,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while new_seen.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(old_seen.lock().await.is_empty());
+        let commands = new_seen.lock().await;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["params"]["x"], 7.0);
     }
 
     fn fps_of(msg: serde_json::Value) -> Option<u32> {
@@ -815,9 +1131,9 @@ mod tests {
     /// whole command, which silently drops the keystroke.
     /// A CDP endpoint that records every command and never replies, so a
     /// dispatcher that waits for a response hangs on the first event.
-    async fn silent_cdp_server() -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
+    async fn silent_cdp_server() -> (String, std::sync::Arc<Mutex<Vec<Value>>>) {
         use futures_util::StreamExt;
-        let seen = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = std::sync::Arc::new(Mutex::new(Vec::<Value>::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!(
             "ws://127.0.0.1:{}/devtools/browser/silent",
@@ -830,8 +1146,8 @@ mod tests {
             let (_tx, mut rx) = ws.split();
             while let Some(Ok(Message::Text(text))) = rx.next().await {
                 if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                    if let Some(m) = v.get("method").and_then(|m| m.as_str()) {
-                        recorded.lock().await.push(m.to_string());
+                    if v.get("method").and_then(Value::as_str).is_some() {
+                        recorded.lock().await.push(v);
                     }
                 }
             }
@@ -883,7 +1199,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(
-            *seen.lock().await,
+            seen.lock()
+                .await
+                .iter()
+                .map(|v| v["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
             vec![
                 "Input.dispatchMouseEvent",
                 "Input.dispatchMouseEvent",

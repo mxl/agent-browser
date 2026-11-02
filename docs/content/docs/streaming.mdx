@@ -58,11 +58,16 @@ Browser clients must load from `localhost`, `127.0.0.1`, `::1` or `file://`. Any
 
 ### Frame messages
 
+Before current Chrome frames, the server sends `{"type":"binding","bindingEpoch":"<server-uuid>"}`. A null epoch disables input. Each frame carries the same opaque epoch. Clear drawn input state on binding changes or reconnect, and echo only the epoch of the frame you finished drawing in every mouse, keyboard, and touch message. Never stamp a new epoch onto old pixels. Missing or stale epochs and client-supplied session/target routing are rejected under the same guards that protect the CDP send.
+
+The epoch identifies the CDP client and target binding, not the document. Same-target navigation does not rotate it, and cleanup of held keys in the old target is not guaranteed.
+
 The server sends frame messages with base64-encoded images:
 
 ```json
 {
   "type": "frame",
+  "bindingEpoch": "<server-uuid>",
   "seq": 41,
   "data": "<base64-encoded-jpeg>",
   "metadata": {
@@ -182,6 +187,7 @@ Send input events to control the browser remotely. Mouse, keyboard, and touch in
 // Click
 {
   "type": "input_mouse",
+  "bindingEpoch": "<drawn-frame-epoch>",
   "eventType": "mousePressed",
   "x": 100,
   "y": 200,
@@ -192,6 +198,7 @@ Send input events to control the browser remotely. Mouse, keyboard, and touch in
 // Release
 {
   "type": "input_mouse",
+  "bindingEpoch": "<drawn-frame-epoch>",
   "eventType": "mouseReleased",
   "x": 100,
   "y": 200,
@@ -201,6 +208,7 @@ Send input events to control the browser remotely. Mouse, keyboard, and touch in
 // Move
 {
   "type": "input_mouse",
+  "bindingEpoch": "<drawn-frame-epoch>",
   "eventType": "mouseMoved",
   "x": 150,
   "y": 250
@@ -209,6 +217,7 @@ Send input events to control the browser remotely. Mouse, keyboard, and touch in
 // Scroll
 {
   "type": "input_mouse",
+  "bindingEpoch": "<drawn-frame-epoch>",
   "eventType": "mouseWheel",
   "x": 100,
   "y": 200,
@@ -223,6 +232,7 @@ Send input events to control the browser remotely. Mouse, keyboard, and touch in
 // Key down
 {
   "type": "input_keyboard",
+  "bindingEpoch": "<drawn-frame-epoch>",
   "eventType": "keyDown",
   "key": "Enter",
   "code": "Enter"
@@ -231,6 +241,7 @@ Send input events to control the browser remotely. Mouse, keyboard, and touch in
 // Key up
 {
   "type": "input_keyboard",
+  "bindingEpoch": "<drawn-frame-epoch>",
   "eventType": "keyUp",
   "key": "Enter",
   "code": "Enter"
@@ -239,6 +250,7 @@ Send input events to control the browser remotely. Mouse, keyboard, and touch in
 // Type character
 {
   "type": "input_keyboard",
+  "bindingEpoch": "<drawn-frame-epoch>",
   "eventType": "char",
   "text": "a"
 }
@@ -246,6 +258,7 @@ Send input events to control the browser remotely. Mouse, keyboard, and touch in
 // With modifiers (1=Alt, 2=Ctrl, 4=Meta, 8=Shift)
 {
   "type": "input_keyboard",
+  "bindingEpoch": "<drawn-frame-epoch>",
   "eventType": "keyDown",
   "key": "c",
   "code": "KeyC",
@@ -259,6 +272,7 @@ Send input events to control the browser remotely. Mouse, keyboard, and touch in
 // Touch start
 {
   "type": "input_touch",
+  "bindingEpoch": "<drawn-frame-epoch>",
   "eventType": "touchStart",
   "touchPoints": [{ "x": 100, "y": 200 }]
 }
@@ -266,6 +280,7 @@ Send input events to control the browser remotely. Mouse, keyboard, and touch in
 // Touch move
 {
   "type": "input_touch",
+  "bindingEpoch": "<drawn-frame-epoch>",
   "eventType": "touchMove",
   "touchPoints": [{ "x": 150, "y": 250 }]
 }
@@ -273,6 +288,7 @@ Send input events to control the browser remotely. Mouse, keyboard, and touch in
 // Touch end
 {
   "type": "input_touch",
+  "bindingEpoch": "<drawn-frame-epoch>",
   "eventType": "touchEnd",
   "touchPoints": []
 }
@@ -280,6 +296,7 @@ Send input events to control the browser remotely. Mouse, keyboard, and touch in
 // Multi-touch (pinch zoom)
 {
   "type": "input_touch",
+  "bindingEpoch": "<drawn-frame-epoch>",
   "eventType": "touchStart",
   "touchPoints": [
     { "x": 100, "y": 200, "id": 0 },

@@ -1,5 +1,7 @@
 export interface FrameMessage {
   type: "frame";
+  /** Opaque server binding identity; echoed only from the frame actually drawn. */
+  bindingEpoch: string;
   /** Monotonic frame id. Echoed in an `ack` message under ack pacing. */
   seq: number;
   data: string;
@@ -85,7 +87,13 @@ export interface TabsMessage {
   timestamp: number;
 }
 
+export interface BindingMessage {
+  type: "binding";
+  bindingEpoch: string | null;
+}
+
 export type StreamMessage =
+  | BindingMessage
   | FrameMessage
   | StatusMessage
   | CommandMessage
