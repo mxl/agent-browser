@@ -582,6 +582,10 @@ async fn reader_loop(
                     }
                     continue;
                 }
+                // Validate text before activity tracking or acquiring ownership guards.
+                if msg_type == "input_text" && input_text(&parsed).is_none() {
+                    continue;
+                }
                 dispatch_bound_input(
                     msg_type,
                     &parsed,
@@ -606,7 +610,9 @@ async fn dispatch_bound_input(
     binding: &RwLock<super::StreamBinding>,
     idle_activity: &IdleActivity,
 ) {
-    if !is_user_input_message_type(msg_type) {
+    if !is_user_input_message_type(msg_type)
+        || (msg_type == "input_text" && input_text(parsed).is_none())
+    {
         return;
     }
     let client_guard = client_slot.read().await;
@@ -684,6 +690,23 @@ fn keyboard_params(parsed: &Value) -> Value {
     Value::Object(params)
 }
 
+// Keep this UTF-8 byte limit aligned with dashboard/src/lib/viewport-input.ts.
+const MAX_INPUT_TEXT_BYTES: usize = 64 * 1024;
+
+/// Text-only, bounded stream message. No client-supplied session/target routing
+/// or extra fields are accepted. Never log or broadcast its contents.
+fn input_text(parsed: &Value) -> Option<&str> {
+    let object = parsed.as_object()?;
+    if object.len() != 3
+        || object.get("type")?.as_str()? != "input_text"
+        || object.get("bindingEpoch")?.as_str()?.len() != 36
+    {
+        return None;
+    }
+    let text = object.get("text")?.as_str()?;
+    (!text.is_empty() && text.len() <= MAX_INPUT_TEXT_BYTES).then_some(text)
+}
+
 /// Dispatches one client input event to CDP.
 ///
 /// Invariant: sends without awaiting Chrome's reply. The reply carries nothing
@@ -725,6 +748,17 @@ async fn dispatch_input(
                 )
                 .await;
         }
+        "input_text" => {
+            if let (Some(text), Some(sid)) = (input_text(parsed), session_id) {
+                let _ = client
+                    .send_command_no_wait(
+                        "Input.insertText",
+                        Some(json!({ "text": text })),
+                        Some(sid),
+                    )
+                    .await;
+            }
+        }
         "input_touch" => {
             let _ = client
                 .send_command_no_wait(
@@ -744,24 +778,111 @@ async fn dispatch_input(
 }
 
 fn is_user_input_message_type(msg_type: &str) -> bool {
-    matches!(msg_type, "input_mouse" | "input_keyboard" | "input_touch")
+    matches!(
+        msg_type,
+        "input_mouse" | "input_keyboard" | "input_touch" | "input_text"
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    const TEST_EPOCH: &str = "11111111-1111-4111-8111-111111111111";
 
     #[test]
     fn dashboard_input_messages_count_as_user_activity() {
-        for msg_type in ["input_mouse", "input_keyboard", "input_touch"] {
+        for msg_type in ["input_mouse", "input_keyboard", "input_touch", "input_text"] {
             assert!(is_user_input_message_type(msg_type));
         }
         assert!(!is_user_input_message_type("status"));
         assert!(!is_user_input_message_type("frame"));
     }
 
+    #[test]
+    fn test_input_text_schema_and_utf8_byte_limit() {
+        let valid = json!({"type": "input_text", "bindingEpoch": TEST_EPOCH, "text": "line 1\nстрока 2 漢字"});
+        assert_eq!(input_text(&valid), valid["text"].as_str());
+        let at_limit = json!({"type": "input_text", "bindingEpoch": TEST_EPOCH, "text": "a".repeat(MAX_INPUT_TEXT_BYTES)});
+        assert!(input_text(&at_limit).is_some());
+        for invalid in [
+            json!(null),
+            json!({"type": "input_text"}),
+            json!({"type": "input_text", "text": "missing epoch"}),
+            json!({"type": "input_text", "bindingEpoch": 7, "text": "wrong epoch type"}),
+            json!({"type": "input_text", "bindingEpoch": TEST_EPOCH, "text": null}),
+            json!({"type": "input_text", "bindingEpoch": TEST_EPOCH, "text": 123}),
+            json!({"type": "input_text", "bindingEpoch": TEST_EPOCH, "text": ""}),
+            json!({"type": "input_keyboard", "text": "not paste"}),
+            json!({"type": "input_text", "bindingEpoch": TEST_EPOCH, "text": "safe", "sessionId": "other"}),
+            json!({"type": "input_text", "bindingEpoch": TEST_EPOCH, "text": "a".repeat(MAX_INPUT_TEXT_BYTES + 1)}),
+            json!({"type": "input_text", "bindingEpoch": TEST_EPOCH, "text": "я".repeat(MAX_INPUT_TEXT_BYTES / 2 + 1)}),
+        ] {
+            assert!(input_text(&invalid).is_none());
+        }
+    }
+
     #[tokio::test]
-    async fn test_stale_displayed_frame_input_is_rejected_across_binding_changes() {
+    async fn test_input_text_dispatch_is_bounded_and_pins_session() {
+        let (url, seen) = silent_cdp_server().await;
+        let client = CdpClient::connect(&url).await.expect("mock cdp connect");
+        let message =
+            json!({"type": "input_text", "bindingEpoch": TEST_EPOCH, "text": "synthetic\nтекст"});
+        let dispatched = tokio::time::timeout(Duration::from_secs(5), async {
+            dispatch_input("input_text", &message, &client, None).await;
+            dispatch_input(
+                "input_text",
+                &json!({"type": "input_text", "bindingEpoch": TEST_EPOCH, "text": 3}),
+                &client,
+                Some("S-PINNED"),
+            )
+            .await;
+            dispatch_input(
+                "input_text",
+                &json!({"type": "input_text", "bindingEpoch": TEST_EPOCH, "text": "a".repeat(MAX_INPUT_TEXT_BYTES + 1)}),
+                &client,
+                Some("S-PINNED"),
+            )
+            .await;
+            dispatch_input(
+                "input_text",
+                &json!({"type": "input_text", "bindingEpoch": TEST_EPOCH, "text": "no", "sessionId": "S-OTHER"}),
+                &client,
+                Some("S-PINNED"),
+            )
+            .await;
+            dispatch_input("input_text", &message, &client, Some("S-PINNED")).await;
+            dispatch_input("input_text", &message, &client, Some("")).await;
+            // A trailing marker proves all earlier commands were drained.
+            dispatch_input(
+                "input_keyboard",
+                &json!({"eventType": "keyUp", "key": "Control"}),
+                &client,
+                Some("S-PINNED"),
+            )
+            .await;
+        })
+        .await;
+        assert!(dispatched.is_ok(), "text must not await a CDP reply");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while seen.lock().await.len() < 3 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("mock should receive all dispatched input");
+        let commands = seen.lock().await;
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[0]["method"], "Input.insertText");
+        assert_eq!(commands[0]["params"], json!({"text": "synthetic\nтекст"}));
+        assert_eq!(commands[0]["sessionId"], "S-PINNED");
+        assert_eq!(commands[1]["method"], "Input.insertText");
+        assert!(commands[1].get("sessionId").is_none());
+        assert_eq!(commands[2]["method"], "Input.dispatchKeyEvent");
+        assert_eq!(client.pending_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_stale_displayed_frame_paste_is_rejected_across_binding_changes() {
         let (url, seen) = silent_cdp_server().await;
         let client = Arc::new(CdpClient::connect(&url).await.unwrap());
         let activity = Arc::new(IdleActivity::new());
@@ -792,7 +913,7 @@ mod tests {
             serde_json::from_str::<Value>(&prefix).unwrap()["bindingEpoch"],
             displayed_a_epoch
         );
-        let input_a = json!({"type": "input_mouse", "bindingEpoch": displayed_a_epoch, "x": 1});
+        let paste_a = json!({"type": "input_text", "bindingEpoch": displayed_a_epoch, "text": "synthetic stale paste"});
         server
             .bind_cdp_session_and_broadcast_tabs(Some("B".into()), &[])
             .await;
@@ -805,8 +926,8 @@ mod tests {
             "never refresh an old frame's epoch"
         );
         dispatch_bound_input(
-            "input_mouse",
-            &input_a,
+            "input_text",
+            &paste_a,
             &slot,
             &server.cdp_session_id,
             &activity,
@@ -823,10 +944,10 @@ mod tests {
             )
             .await;
         }
-        let input_b = json!({"type": "input_mouse", "bindingEpoch": b_epoch, "x": 2});
+        let paste_b = json!({"type": "input_text", "bindingEpoch": b_epoch, "text": "synthetic B"});
         dispatch_bound_input(
-            "input_mouse",
-            &input_b,
+            "input_text",
+            &paste_b,
             &slot,
             &server.cdp_session_id,
             &activity,
@@ -841,16 +962,16 @@ mod tests {
             "A->B->A must not reuse A's old token"
         );
         dispatch_bound_input(
-            "input_mouse",
-            &input_a,
+            "input_text",
+            &paste_a,
             &slot,
             &server.cdp_session_id,
             &activity,
         )
         .await;
-        let fresh = json!({"type": "input_mouse", "bindingEpoch": fresh_a_epoch, "x": 3});
+        let fresh = json!({"type": "input_text", "bindingEpoch": fresh_a_epoch, "text": "synthetic fresh A"});
         dispatch_bound_input(
-            "input_mouse",
+            "input_text",
             &fresh,
             &slot,
             &server.cdp_session_id,
@@ -864,7 +985,7 @@ mod tests {
             Some(&client),
         ));
         assert_ne!(restarted.read().await.epoch, fresh_a_epoch);
-        dispatch_bound_input("input_mouse", &fresh, &slot, &restarted, &activity).await;
+        dispatch_bound_input("input_text", &fresh, &slot, &restarted, &activity).await;
         // A marker after all attempted sends proves stale events sent nothing.
         dispatch_bound_input(
             "input_keyboard",
@@ -883,11 +1004,11 @@ mod tests {
         .unwrap();
         let commands = seen.lock().await;
         assert_eq!(commands.len(), 3, "no stale input may reach CDP");
-        assert_eq!(commands[0]["method"], "Input.dispatchMouseEvent");
+        assert_eq!(commands[0]["method"], "Input.insertText");
         assert_eq!(commands[0]["sessionId"], "B");
-        assert_eq!(commands[0]["params"]["x"], 2.0);
+        assert_eq!(commands[0]["params"]["text"], "synthetic B");
         assert_eq!(commands[1]["sessionId"], "A");
-        assert_eq!(commands[1]["params"]["x"], 3.0);
+        assert_eq!(commands[1]["params"]["text"], "synthetic fresh A");
         assert_eq!(commands[2]["method"], "Input.dispatchKeyEvent");
         drop(commands);
         server.shutdown().await;
@@ -909,14 +1030,7 @@ mod tests {
         let activity = Arc::new(IdleActivity::new());
         let waiting_activity = activity.clone();
         let queued = tokio::spawn(async move {
-            dispatch_bound_input(
-                "input_mouse",
-                &json!({"type": "input_mouse", "bindingEpoch": old_epoch, "x": 4}),
-                &waiting_slot,
-                &waiting_binding,
-                &waiting_activity,
-            )
-            .await;
+            dispatch_bound_input("input_text", &json!({"type": "input_text", "bindingEpoch": old_epoch, "text": "must not reach B"}), &waiting_slot, &waiting_binding, &waiting_activity).await;
         });
         // The old event is queued behind a writer, not merely checked against
         // a client-side attribute. The send must validate the post-rebind state.
@@ -932,8 +1046,8 @@ mod tests {
         drop(writer);
         queued.await.unwrap();
         dispatch_bound_input(
-            "input_mouse",
-            &json!({"type": "input_mouse", "bindingEpoch": new_epoch, "x": 5}),
+            "input_text",
+            &json!({"type": "input_text", "bindingEpoch": new_epoch, "text": "current B"}),
             &slot,
             &binding,
             &activity,
@@ -949,7 +1063,7 @@ mod tests {
         let commands = seen.lock().await;
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0]["sessionId"], "B");
-        assert_eq!(commands[0]["params"]["x"], 5.0);
+        assert_eq!(commands[0]["params"]["text"], "current B");
     }
 
     #[tokio::test]
@@ -964,22 +1078,22 @@ mod tests {
             Some(&old),
         ));
         let epoch = binding.read().await.epoch.clone();
-        let input = json!({"type": "input_mouse", "bindingEpoch": epoch, "x": 6});
+        let paste = json!({"type": "input_text", "bindingEpoch": epoch, "text": "old pixels"});
         let activity = IdleActivity::new();
         // Models update_stream_client's gap between changing client_slot and
         // rebinding the page session. An old token must authorize neither client.
         *slot.write().await = Some(new.clone());
-        dispatch_bound_input("input_mouse", &input, &slot, &binding, &activity).await;
+        dispatch_bound_input("input_text", &paste, &slot, &binding, &activity).await;
         binding
             .write()
             .await
             .rebind(Some("same-session".into()), Some(&new));
         let fresh = binding.read().await.epoch.clone();
         assert_ne!(epoch, fresh);
-        dispatch_bound_input("input_mouse", &input, &slot, &binding, &activity).await;
+        dispatch_bound_input("input_text", &paste, &slot, &binding, &activity).await;
         dispatch_bound_input(
-            "input_mouse",
-            &json!({"type": "input_mouse", "bindingEpoch": fresh, "x": 7}),
+            "input_text",
+            &json!({"type": "input_text", "bindingEpoch": fresh, "text": "new pixels"}),
             &slot,
             &binding,
             &activity,
@@ -995,7 +1109,7 @@ mod tests {
         assert!(old_seen.lock().await.is_empty());
         let commands = new_seen.lock().await;
         assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0]["params"]["x"], 7.0);
+        assert_eq!(commands[0]["params"]["text"], "new pixels");
     }
 
     fn fps_of(msg: serde_json::Value) -> Option<u32> {
