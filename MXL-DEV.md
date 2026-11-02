@@ -44,6 +44,14 @@ bin/agent-browser-darwin-arm64 --version
 
 The package version alone does not identify the fork. Record the branch commit and compare the installed binary's SHA-256 with the locally built binary.
 
+## Test scope
+
+Run the focused stream and dashboard-input tests before installation. The documentation checks also cover the changed protocol examples.
+
+The broad upstream Rust suite includes `native::parity_tests::test_all_documented_actions_are_handled`, which launches a real Chrome instance despite not being marked ignored. It did not complete in local validation. A browser-free broad run must explicitly skip that test and use a disposable `HOME` and `TMPDIR`; preserve the intended Cargo/Rust toolchain cache locations separately. Do not describe that excluded run as a complete browser E2E qualification.
+
+The fork does not change or disable the upstream parity test. Real-browser tests and replacement of running browser sessions require their own coordinated run.
+
 ## Installation precautions
 
 A Git URL or package checkout without the built platform binary is insufficient: the upstream `postinstall` script can download an unmodified upstream release. Register or package only after the native build, and verify the installed executable's provenance.
