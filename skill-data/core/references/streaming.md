@@ -69,7 +69,11 @@ Every message is JSON text with a `type` field.
 
 Status, tabs, url, and console travel on an ordered channel: they are delivered in order and are never replaced by a newer message the way frames are. They are not unconditionally durable. A client that falls far enough behind can lag out of that channel and lose messages it never saw, so treat console output as a live feed, not an audit log.
 
+Frame geometry comes from CDP; configured viewport dimensions are only fallbacks for missing metadata. Keep each image with its metadata until it is drawn, and cancel older asynchronous decodes. For a bitmap of width `W`, use a canvas height of `deviceHeight * W / deviceWidth` and draw at `offsetTop * W / deviceWidth`. Map display coordinates into device-independent pixels and subtract `offsetTop` once from Y. Do not multiply by DPR or divide by `pageScaleFactor` for CDP input.
+
 ## Messages from the client
+
+These messages belong to the WebSocket protocol. They have no dedicated CLI command or MCP tool; existing CLI and MCP parser delegation is unchanged.
 
 ```json
 {"type": "input_mouse", "eventType": "mousePressed", "x": 40, "y": 40, "button": "left", "clickCount": 1}

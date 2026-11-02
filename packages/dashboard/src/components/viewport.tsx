@@ -6,6 +6,7 @@ import { ArrowLeft, ArrowRight, Camera, Circle, FileCode, Maximize, Moon, Rotate
 import { cn } from "@/lib/utils";
 import { execCommand, sessionArgs } from "@/lib/exec";
 import { getSessionStreamUrl } from "@/lib/dashboard-routes";
+import { frameCanvasLayout, validFrameGeometry, viewportPoint, type FrameGeometry } from "@/lib/viewport-input";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import {
@@ -158,6 +159,7 @@ export function Viewport() {
   const sendInput = useSetAtom(sendInputAtom);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const drawnGeometryRef = useRef<FrameGeometry | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasAreaRef = useRef<HTMLDivElement>(null);
   const addressRef = useRef<HTMLInputElement>(null);
@@ -233,28 +235,37 @@ export function Viewport() {
     }
   }, [addressValue, navigating, runCmd, url]);
 
-  const drawFrame = useCallback((base64: string) => {
+  useEffect(() => {
+    drawnGeometryRef.current = null;
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (canvas) canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
+  }, [sessionName, streamPort]);
 
-    const bin = atob(base64);
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !frame || !validFrameGeometry(frame.metadata)) return;
+    let cancelled = false;
+    const bin = atob(frame.data);
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
 
     createImageBitmap(new Blob([bytes], { type: "image/jpeg" })).then((bmp) => {
-      canvas.width = bmp.width;
-      canvas.height = bmp.height;
-      const ctx = canvas.getContext("2d");
-      if (ctx) ctx.drawImage(bmp, 0, 0);
+      // Geometry changes only when its pixels are drawn. Ignore stale decodes.
+      if (!cancelled) {
+        const meta = frame.metadata;
+        const layout = frameCanvasLayout(bmp.width, meta);
+        canvas.width = layout.width;
+        canvas.height = layout.height;
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          ctx.drawImage(bmp, 0, layout.imageY);
+          drawnGeometryRef.current = meta;
+        }
+      }
       bmp.close();
-    });
-  }, []);
-
-  useEffect(() => {
-    if (frame) {
-      drawFrame(frame);
-    }
-  }, [frame, drawFrame]);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [frame, sessionName, streamPort]);
 
   const isFit =
     canvasArea.width > 0 &&
@@ -332,16 +343,11 @@ export function Viewport() {
   const toViewport = useCallback(
     (e: React.MouseEvent): { x: number; y: number } | null => {
       const canvas = canvasRef.current;
-      if (!canvas) return null;
-      const rect = canvas.getBoundingClientRect();
-      const scaleX = viewportWidth / rect.width;
-      const scaleY = viewportHeight / rect.height;
-      return {
-        x: Math.round((e.clientX - rect.left) * scaleX),
-        y: Math.round((e.clientY - rect.top) * scaleY),
-      };
+      const meta = drawnGeometryRef.current;
+      if (!canvas || !meta) return null;
+      return viewportPoint(e.clientX, e.clientY, canvas.getBoundingClientRect(), meta);
     },
-    [viewportWidth, viewportHeight],
+    [],
   );
 
   const handleMouseEvent = useCallback(
