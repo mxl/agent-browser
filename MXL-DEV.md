@@ -56,7 +56,7 @@ PATH="$HOME/.local/share/agent-browser-mxl-dev/pnpm/bin:$PATH" \
 pnpm add --global --ignore-scripts .
 ```
 
-The global command must resolve to that registration's shim even if another package manager previously installed agent-browser earlier on `PATH`. Preserve the previous entrypoint before replacing a conflicting symlink, and verify the selected executable and native-binary hash afterward. Merely adding a package to a global directory does not establish which command your shell invokes.
+The global command must resolve to that registration's entrypoint even if another package manager previously installed agent-browser earlier on `PATH`. The entrypoint can point directly to the locally built native binary, as the upstream installer does, to avoid a JavaScript launcher. Preserve the previous entrypoint before replacing a conflicting symlink, and verify the selected executable and native-binary hash afterward. Merely adding a package to a global directory does not establish which command your shell invokes.
 
 Do not run `agent-browser upgrade` to update this fork: that command follows the package-manager release channel, not this Git branch. Update `mxl-dev`, rebuild it, and reinstall the verified local artifact.
 
