@@ -48,7 +48,15 @@ The package version alone does not identify the fork. Record the branch commit a
 
 A Git URL or package checkout without the built platform binary is insufficient: the upstream `postinstall` script can download an unmodified upstream release. Register or package only after the native build, and verify the installed executable's provenance.
 
-With pnpm 11, local global registration uses `pnpm add --global .`, not the older `pnpm link --global` workflow. Lifecycle scripts are not needed once the local binary exists. The global command must resolve to the fork's artifact even if another package manager previously installed agent-browser earlier on `PATH`.
+With pnpm 11, local global registration uses `pnpm add --global .`, not the older `pnpm link --global` workflow. Lifecycle scripts are not needed once the local binary exists. A separate pnpm home keeps this registration apart from other globally installed tools:
+
+```sh
+PNPM_HOME="$HOME/.local/share/agent-browser-mxl-dev/pnpm" \
+PATH="$HOME/.local/share/agent-browser-mxl-dev/pnpm/bin:$PATH" \
+pnpm add --global --ignore-scripts .
+```
+
+The global command must resolve to that registration's shim even if another package manager previously installed agent-browser earlier on `PATH`. Preserve the previous entrypoint before replacing a conflicting symlink, and verify the selected executable and native-binary hash afterward. Merely adding a package to a global directory does not establish which command your shell invokes.
 
 Do not run `agent-browser upgrade` to update this fork: that command follows the package-manager release channel, not this Git branch. Update `mxl-dev`, rebuild it, and reinstall the verified local artifact.
 
