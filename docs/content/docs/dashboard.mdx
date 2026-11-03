@@ -40,6 +40,8 @@ agent-browser stream disable
 
 ## Dashboard features
 
+Connected Chrome stream viewers trigger best-effort focus emulation on the active CDP session, including when the dashboard is the viewer. This can trigger page focus/visibility handlers and background work; it does not guarantee a visible page. The request lasts while any stream viewer remains connected, with best-effort cleanup on the last viewer's disconnect, rebinding, or stream shutdown. Other engines are unchanged. See [Chrome focus and visibility](/streaming#chrome-focus-and-visibility) for the shared CLI/MCP lifecycle.
+
 Focus the live canvas and use your browser's native paste shortcut to insert plain text in the remote page. Only user-initiated `text/plain` paste is forwarded, up to 64 KiB of UTF-8. Empty or oversized text is rejected, not truncated. HTML, images, and remote clipboard updates are not supported, and the dashboard does not read the clipboard API. The paste shortcut is not also sent as a remote keystroke.
 
 Pointer input uses the drawn frame's device-independent geometry and top offset. All canvas input echoes that frame's server-issued binding epoch; reconnecting or changing the binding disables input until a current frame is drawn. Ordinary Unicode text, physical key positions, numpad keys, and modifier shortcuts remain distinct. On blur, tracked keys are released with their original epoch. Rebinding discards old key state rather than releasing it into another target; cleanup in the old target is not guaranteed. The epoch identifies a CDP client/target binding, not a document navigation.

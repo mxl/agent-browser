@@ -109,6 +109,51 @@ async fn publish_url(
     let _ = frame_tx.send(message.to_string());
 }
 
+// Keep the exact connection and page session that accepted the override.
+// Capture epochs also rotate on resize, so they are not focus ownership IDs.
+// A valid same-page viewport restart must not toggle focus or visibility.
+struct FocusOwner {
+    client: Arc<CdpClient>,
+    session_id: String,
+}
+
+impl FocusOwner {
+    fn matches(&self, client: &Arc<CdpClient>, session_id: Option<&str>) -> bool {
+        Arc::ptr_eq(&self.client, client) && session_id == Some(self.session_id.as_str())
+    }
+
+    async fn set_enabled(&self, enabled: bool) -> bool {
+        matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                self.client.send_command(
+                    "Emulation.setFocusEmulationEnabled",
+                    Some(json!({ "enabled": enabled })),
+                    Some(&self.session_id),
+                ),
+            )
+            .await,
+            Ok(Ok(_))
+        )
+    }
+
+    async fn release(self) {
+        // CDP has no getter for another controller's prior override. Reset is
+        // best effort, not restoration of foreign state or physical focus.
+        if !self.set_enabled(false).await {
+            eprintln!(
+                "Warning: stream focus emulation reset failed; page focus may remain overridden."
+            );
+        }
+    }
+}
+
+async fn release_focus(owner: &mut Option<FocusOwner>) {
+    if let Some(old) = owner.take() {
+        old.release().await;
+    }
+}
+
 struct CarriedEvents {
     client: Arc<CdpClient>,
     receiver: broadcast::Receiver<CdpEvent>,
@@ -160,13 +205,15 @@ pub(super) async fn cdp_event_loop(
     // while restarting a screencast on the same client so navigation events
     // emitted during the restart remain queued for the rebound session.
     let mut carried_events: Option<CarriedEvents> = None;
+    let mut focus_owner: Option<FocusOwner> = None;
     loop {
         tokio::select! {
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
                     let session_id = cdp_session_id.read().await.session_id.clone();
                     if *screencasting.lock().await {
-                        if let Some(ref client) = *client_slot.read().await {
+                        let client = client_slot.read().await.clone();
+                        if let Some(client) = client {
                             let _ = client
                                 .send_command_no_params("Page.stopScreencast", session_id.as_deref())
                                 .await;
@@ -174,6 +221,7 @@ pub(super) async fn cdp_event_loop(
                         let mut sc = screencasting.lock().await;
                         *sc = false;
                     }
+                    release_focus(&mut focus_owner).await;
                     return;
                 }
             }
@@ -205,6 +253,66 @@ pub(super) async fn cdp_event_loop(
                 let is_chrome = eng == "chrome";
                 let supports_screencast = is_chrome;
                 let supports_same_document_navigation = is_chrome;
+
+                if focus_owner.as_ref().is_some_and(|owner| {
+                    !is_chrome
+                        || loop_epoch.is_none()
+                        || !owner.matches(&client_arc, session_id.as_deref())
+                }) {
+                    release_focus(&mut focus_owner).await;
+                }
+                if is_chrome && focus_owner.is_none() {
+                    if let (Some(session_id), Some(epoch)) = (&session_id, &loop_epoch) {
+                        let attempted = FocusOwner {
+                            client: Arc::clone(&client_arc),
+                            session_id: session_id.clone(),
+                        };
+                        // Hidden Chrome pages can stop producing frames. Emulating
+                        // focus also makes the page visible, before capture starts,
+                        // for the aggregate viewer lifetime on this connection.
+                        if attempted.set_enabled(true).await {
+                            focus_owner = Some(attempted);
+                        } else {
+                            eprintln!("Warning: stream focus emulation enable failed; continuing without confirmed focus.");
+                            // A timeout can hide a late successful enable. Send one
+                            // bounded reset to the attempted owner, never a new page.
+                            attempted.release().await;
+                        }
+                        // Binding/viewer changes can arrive while the RPC waits.
+                        // Do not start a stale cast or retain a stale override.
+                        let current_client = client_slot.read().await.clone();
+                        let binding = cdp_session_id.read().await;
+                        let same_valid_page = current_client.as_ref().is_some_and(|client| {
+                            Arc::ptr_eq(client, &client_arc)
+                                && binding.session_id.as_ref() == Some(session_id)
+                                && binding.epoch_for(Some(client)).is_some()
+                        });
+                        let capture_epoch_changed =
+                            binding.epoch_for(Some(&client_arc)) != Some(epoch.as_str());
+                        drop(binding);
+                        let has_viewers = *client_count.lock().await > 0;
+                        let shutting_down = *shutdown_rx.borrow();
+                        if !same_valid_page || !has_viewers || shutting_down {
+                            release_focus(&mut focus_owner).await;
+                            if shutting_down {
+                                return;
+                            }
+                            client_notify.notify_one();
+                            continue;
+                        }
+                        if capture_epoch_changed {
+                            // Resize during enable invalidates capture, not page
+                            // focus. Restart with the new epoch without toggling.
+                            carried_events = Some(CarriedEvents {
+                                client: Arc::clone(&client_arc),
+                                receiver: event_rx,
+                                queued: queued_events,
+                            });
+                            client_notify.notify_one();
+                            continue;
+                        }
+                    }
+                }
 
                 if supports_screencast {
                     let _ = client_arc
@@ -291,27 +399,25 @@ pub(super) async fn cdp_event_loop(
                         changed = shutdown_rx.changed() => {
                             if changed.is_err() || *shutdown_rx.borrow() {
                                 if supports_screencast {
-                                    let session_id = cdp_session_id.read().await.session_id.clone();
                                     let _ = client_arc
                                         .send_command_no_params("Page.stopScreencast", session_id.as_deref())
                                         .await;
                                 }
-                                let mut sc = screencasting.lock().await;
-                                *sc = false;
+                                *screencasting.lock().await = false;
+                                release_focus(&mut focus_owner).await;
                                 return;
                             }
                         }
                         _ = client_notify.notified() => {
                             let count = *client_count.lock().await;
-                            let new_session_id = cdp_session_id.read().await.session_id.clone();
                             if count == 0 {
                                 if supports_screencast {
                                     let _ = client_arc
                                         .send_command_no_params("Page.stopScreencast", session_id.as_deref())
                                         .await;
                                 }
-                                let mut sc = screencasting.lock().await;
-                                *sc = false;
+                                *screencasting.lock().await = false;
+                                release_focus(&mut focus_owner).await;
                                 break;
                             }
                             let client_changed = {
@@ -321,12 +427,17 @@ pub(super) async fn cdp_event_loop(
                                     .is_some_and(|c| Arc::ptr_eq(c, &client_arc));
                                 !same
                             };
-                            let epoch_changed = cdp_session_id.read().await.epoch_for(Some(&client_arc)) != loop_epoch.as_deref();
-                            let session_changed = new_session_id != session_id || epoch_changed;
+                            let binding = cdp_session_id.read().await;
+                            let new_session_id = binding.session_id.clone();
+                            let new_epoch = binding.epoch_for(Some(&client_arc));
+                            let epoch_changed = new_epoch != loop_epoch.as_deref();
+                            let binding_invalid = new_epoch.is_none();
+                            drop(binding);
+                            let session_changed = new_session_id != session_id;
                             let new_vw = *viewport_width.lock().await;
                             let new_vh = *viewport_height.lock().await;
                             let viewport_changed = new_vw != vw || new_vh != vh;
-                            if client_changed || session_changed || viewport_changed {
+                            if client_changed || session_changed || epoch_changed || viewport_changed {
                                 // The watch retains its latest value across CDP
                                 // restarts. Invalidate it before stopping so a
                                 // client cannot receive a frame from the old
@@ -337,8 +448,10 @@ pub(super) async fn cdp_event_loop(
                                         .send_command_no_params("Page.stopScreencast", session_id.as_deref())
                                         .await;
                                 }
-                                let mut sc = screencasting.lock().await;
-                                *sc = false;
+                                *screencasting.lock().await = false;
+                                if client_changed || session_changed || binding_invalid {
+                                    release_focus(&mut focus_owner).await;
+                                }
                                 if !client_changed {
                                     preserve_queued_non_frame_events(
                                         &mut event_rx,
@@ -552,7 +665,10 @@ pub(super) async fn cdp_event_loop(
                                     }
                                 }
                                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                Err(broadcast::error::RecvError::Closed) => break,
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    release_focus(&mut focus_owner).await;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -560,12 +676,16 @@ pub(super) async fn cdp_event_loop(
             } else {
                 carried_events = None;
                 drop(guard);
+                release_focus(&mut focus_owner).await;
             }
         } else {
             carried_events = None;
+            let client = guard.clone();
+            drop(guard);
+            release_focus(&mut focus_owner).await;
             let was_screencasting = *screencasting.lock().await;
             if was_screencasting {
-                if let Some(ref client) = *guard {
+                if let Some(ref client) = client {
                     let session_id = cdp_session_id.read().await.session_id.clone();
                     let _ = client
                         .send_command_no_params("Page.stopScreencast", session_id.as_deref())
@@ -574,7 +694,6 @@ pub(super) async fn cdp_event_loop(
                 let mut sc = screencasting.lock().await;
                 *sc = false;
             }
-            drop(guard);
         }
     }
 }
@@ -834,6 +953,8 @@ mod tests {
     }
 
     struct LoopHarness {
+        client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
+        client_count: Arc<Mutex<usize>>,
         events: mpsc::UnboundedSender<Value>,
         messages: broadcast::Receiver<String>,
         frames: watch::Receiver<Option<Arc<super::super::StreamFrame>>>,
@@ -890,10 +1011,10 @@ mod tests {
             frame_tx,
             frame_watch,
             Arc::new(super::super::ScreencastConfig::default()),
-            client_slot,
+            client_slot.clone(),
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
-            client_count,
+            client_count.clone(),
             cdp_session_id.clone(),
             viewport_width.clone(),
             Arc::new(Mutex::new(720)),
@@ -905,6 +1026,8 @@ mod tests {
         client_notify.notify_one();
 
         LoopHarness {
+            client_slot,
+            client_count,
             events,
             messages,
             frames,
@@ -1001,6 +1124,440 @@ mod tests {
             Some(binding.epoch.as_str())
         );
         assert_eq!(frame.binding_epoch.as_deref(), Some(binding.epoch.as_str()));
+    }
+
+    // The mock page starts hidden and emits frames only while focus emulation
+    // is enabled. Record complete commands to verify exact connection/session
+    // ownership rather than inferring it from stream status.
+    async fn focus_mock(
+        reject_enable: bool,
+        reject_reset: bool,
+        enable_delay: std::time::Duration,
+    ) -> (Arc<CdpClient>, Arc<Mutex<Vec<Value>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/focus", listener.local_addr().unwrap());
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let recorded = commands.clone();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let mut focused = false;
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let command: Value = serde_json::from_str(&text).unwrap();
+                recorded.lock().await.push(command.clone());
+                let method = command["method"].as_str().unwrap();
+                let mut rejected = false;
+                if method == "Emulation.setFocusEmulationEnabled" {
+                    let enabled = command["params"]["enabled"].as_bool().unwrap();
+                    if enabled {
+                        tokio::time::sleep(enable_delay).await;
+                    }
+                    rejected = if enabled { reject_enable } else { reject_reset };
+                    if !rejected {
+                        focused = enabled;
+                    }
+                }
+                let response = if rejected {
+                    json!({"id": command["id"], "error": {"code": -32601, "message": "unsupported"}})
+                } else {
+                    json!({"id": command["id"], "result": {}})
+                };
+                if ws.send(Message::Text(response.to_string())).await.is_err() {
+                    break;
+                }
+                if method == "Page.startScreencast" && focused {
+                    let mut event = json!({"method": "Page.screencastFrame", "params": {
+                        "sessionId": 1, "data": "fresh-visible-frame", "metadata": {"timestamp": 1.0}
+                    }});
+                    if let Some(session) = command.get("sessionId") {
+                        event["sessionId"] = session.clone();
+                    }
+                    if ws.send(Message::Text(event.to_string())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        (Arc::new(CdpClient::connect(&url).await.unwrap()), commands)
+    }
+
+    async fn focus_harness(
+        session: Option<&str>,
+        engine: &str,
+        reject_enable: bool,
+        reject_reset: bool,
+        delay: std::time::Duration,
+    ) -> (LoopHarness, Arc<Mutex<Vec<Value>>>) {
+        let (client, commands) = focus_mock(reject_enable, reject_reset, delay).await;
+        let (events, _rx) = mpsc::unbounded_channel();
+        let harness = start_loop_with_client_and_engine(
+            session,
+            client,
+            events,
+            Arc::new(Mutex::new(Vec::new())),
+            engine,
+        )
+        .await;
+        (harness, commands)
+    }
+
+    async fn wait_commands(commands: &Mutex<Vec<Value>>, method: &str, count: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if commands
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|c| c["method"] == method)
+                    .count()
+                    >= count
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("missing mock command");
+    }
+
+    fn focus_commands(commands: &[Value]) -> Vec<(Value, Value)> {
+        commands
+            .iter()
+            .filter(|c| c["method"] == "Emulation.setFocusEmulationEnabled")
+            .map(|c| (c["sessionId"].clone(), c["params"]["enabled"].clone()))
+            .collect()
+    }
+
+    async fn resize_with_capture_epoch(harness: &LoopHarness, width: u32) {
+        // Match set_viewport's relevant production transition and lock order:
+        // dimensions change and the capture/input epoch rotates on the same page.
+        let _client = harness.client_slot.read().await;
+        let mut binding = harness.cdp_session_id.write().await;
+        let mut vw = harness.viewport_width.lock().await;
+        *vw = width;
+        binding.epoch = uuid::Uuid::new_v4().to_string();
+        drop(vw);
+        harness.client_notify.notify_one();
+    }
+
+    #[tokio::test]
+    async fn test_focus_hidden_page_frames_and_aggregate_viewer_lifetime() {
+        let (mut h, commands) = focus_harness(
+            Some("PAGE"),
+            "chrome",
+            false,
+            false,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), h.frames.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(h
+            .frames
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .json
+            .contains("fresh-visible-frame"));
+        {
+            let log = commands.lock().await;
+            assert_eq!(log[0]["method"], "Emulation.setFocusEmulationEnabled");
+            assert_eq!(log[0]["sessionId"], "PAGE");
+            assert_eq!(log[1]["method"], "Page.startScreencast");
+            assert_eq!(log[1]["sessionId"], "PAGE");
+        }
+        *h.client_count.lock().await = 2;
+        h.client_notify.notify_one();
+        resize_with_capture_epoch(&h, 900).await;
+        wait_commands(&commands, "Page.startScreencast", 2).await;
+        *h.client_count.lock().await = 1;
+        h.client_notify.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(focus_commands(&commands.lock().await).len(), 1);
+        *h.client_count.lock().await = 0;
+        h.client_notify.notify_one();
+        wait_commands(&commands, "Emulation.setFocusEmulationEnabled", 2).await;
+        stop_loop(h).await;
+        assert_eq!(
+            focus_commands(&commands.lock().await),
+            vec![(json!("PAGE"), json!(true)), (json!("PAGE"), json!(false))]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_focus_rebind_releases_exact_old_connection_and_session() {
+        let (h, old_commands) = focus_harness(
+            Some("OLD"),
+            "chrome",
+            false,
+            false,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        wait_commands(&old_commands, "Page.startScreencast", 1).await;
+        let (new_client, new_commands) = focus_mock(false, false, std::time::Duration::ZERO).await;
+        *h.client_slot.write().await = Some(new_client.clone());
+        *h.cdp_session_id.write().await =
+            super::super::StreamBinding::new(Some("NEW".into()), Some(&new_client));
+        h.client_notify.notify_one();
+        wait_commands(&new_commands, "Page.startScreencast", 1).await;
+        assert_eq!(
+            focus_commands(&old_commands.lock().await),
+            vec![(json!("OLD"), json!(true)), (json!("OLD"), json!(false))]
+        );
+        stop_loop(h).await;
+        assert_eq!(
+            focus_commands(&new_commands.lock().await),
+            vec![(json!("NEW"), json!(true)), (json!("NEW"), json!(false))]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_focus_same_connection_epoch_rebind_and_root_session() {
+        let (h, commands) = focus_harness(
+            Some("PAGE"),
+            "chrome",
+            false,
+            false,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        wait_commands(&commands, "Page.startScreencast", 1).await;
+        let client = h.client_slot.read().await.clone().unwrap();
+        *h.cdp_session_id.write().await =
+            super::super::StreamBinding::new(Some("PAGE".into()), Some(&client));
+        h.client_notify.notify_one();
+        wait_commands(&commands, "Page.startScreencast", 2).await;
+        assert_eq!(
+            focus_commands(&commands.lock().await),
+            vec![(json!("PAGE"), json!(true))]
+        );
+        *h.cdp_session_id.write().await =
+            super::super::StreamBinding::new(Some(String::new()), Some(&client));
+        h.client_notify.notify_one();
+        wait_commands(&commands, "Page.startScreencast", 3).await;
+        stop_loop(h).await;
+        assert_eq!(
+            focus_commands(&commands.lock().await),
+            vec![
+                (json!("PAGE"), json!(true)),
+                (json!("PAGE"), json!(false)),
+                (Value::Null, json!(true)),
+                (Value::Null, json!(false)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_focus_skips_missing_or_invalid_binding_and_non_chrome() {
+        for (session, engine) in [(None, "chrome"), (Some("PAGE"), "lightpanda")] {
+            let (mut h, commands) =
+                focus_harness(session, engine, false, false, std::time::Duration::ZERO).await;
+            next_message_of_type(&mut h.messages, "status").await;
+            stop_loop(h).await;
+            assert!(focus_commands(&commands.lock().await).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_focus_no_viewers_then_first_viewer_unfreezes_hidden_page() {
+        let (mut h, commands) = focus_harness(
+            Some("PAGE"),
+            "chrome",
+            false,
+            false,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        // This current-thread test changes the count before the spawned loop runs.
+        *h.client_count.lock().await = 0;
+        h.client_notify.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(commands.lock().await.is_empty());
+        assert!(h.frames.borrow().is_none());
+        *h.client_count.lock().await = 1;
+        h.client_notify.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), h.frames.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(h.frames.borrow().is_some());
+        stop_loop(h).await;
+        assert_eq!(focus_commands(&commands.lock().await).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_focus_invalid_client_binding_resets_old_and_never_enables_replacement() {
+        let (mut h, old_commands) = focus_harness(
+            Some("PAGE"),
+            "chrome",
+            false,
+            false,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let (replacement, commands) = focus_mock(false, false, std::time::Duration::ZERO).await;
+        // Wait for the initial cast, then replace only the client. The binding
+        // still names the old connection and cannot authorize focus on the new one.
+        next_message_of_type(&mut h.messages, "status").await;
+        *h.client_slot.write().await = Some(replacement);
+        h.client_notify.notify_one();
+        wait_commands(&commands, "Page.startScreencast", 1).await;
+        stop_loop(h).await;
+        assert!(focus_commands(&commands.lock().await).is_empty());
+        assert_eq!(
+            focus_commands(&old_commands.lock().await),
+            vec![(json!("PAGE"), json!(true)), (json!("PAGE"), json!(false))]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_focus_owned_reset_failure_is_bounded_and_does_not_block_shutdown() {
+        let (mut h, commands) = focus_harness(
+            Some("PAGE"),
+            "chrome",
+            false,
+            true,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        next_message_of_type(&mut h.messages, "status").await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), stop_loop(h))
+            .await
+            .unwrap();
+        assert_eq!(
+            focus_commands(&commands.lock().await),
+            vec![(json!("PAGE"), json!(true)), (json!("PAGE"), json!(false))]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_focus_rejected_enable_and_reset_do_not_block_capture_or_claim_owner() {
+        let (mut h, commands) = focus_harness(
+            Some("PAGE"),
+            "chrome",
+            true,
+            true,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        next_message_of_type(&mut h.messages, "status").await;
+        assert!(h.frames.borrow().is_none());
+        wait_commands(&commands, "Page.startScreencast", 1).await;
+        stop_loop(h).await;
+        // One enable attempt and one uncertainty cleanup, no owned reset on shutdown.
+        assert_eq!(
+            focus_commands(&commands.lock().await),
+            vec![(json!("PAGE"), json!(true)), (json!("PAGE"), json!(false))]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_focus_delayed_enable_retains_owner_across_realistic_resize_epoch() {
+        let (mut h, commands) = focus_harness(
+            Some("PAGE"),
+            "chrome",
+            false,
+            false,
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        wait_commands(&commands, "Emulation.setFocusEmulationEnabled", 1).await;
+        let old_epoch = h.cdp_session_id.read().await.epoch.clone();
+        resize_with_capture_epoch(&h, 900).await;
+        let new_epoch = h.cdp_session_id.read().await.epoch.clone();
+        assert_ne!(old_epoch, new_epoch);
+        next_message_of_type(&mut h.messages, "status").await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), h.frames.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            h.frames.borrow().as_ref().unwrap().binding_epoch.as_deref(),
+            Some(new_epoch.as_str())
+        );
+        {
+            let log = commands.lock().await;
+            let casts: Vec<_> = log
+                .iter()
+                .filter(|c| c["method"] == "Page.startScreencast")
+                .collect();
+            assert_eq!(
+                casts.len(),
+                1,
+                "must not start capture with the pre-resize epoch"
+            );
+            assert_eq!(casts[0]["params"]["maxWidth"], 900);
+            assert_eq!(focus_commands(&log), vec![(json!("PAGE"), json!(true))]);
+        }
+        *h.client_count.lock().await = 0;
+        h.client_notify.notify_one();
+        wait_commands(&commands, "Emulation.setFocusEmulationEnabled", 2).await;
+        stop_loop(h).await;
+        assert_eq!(
+            focus_commands(&commands.lock().await),
+            vec![(json!("PAGE"), json!(true)), (json!("PAGE"), json!(false))]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_focus_successful_delayed_enable_is_reset_on_pending_shutdown() {
+        let (h, commands) = focus_harness(
+            Some("OLD"),
+            "chrome",
+            false,
+            false,
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        wait_commands(&commands, "Emulation.setFocusEmulationEnabled", 1).await;
+        h.shutdown.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), h.task)
+            .await
+            .unwrap()
+            .unwrap();
+        let log = commands.lock().await;
+        assert_eq!(
+            focus_commands(&log),
+            vec![(json!("OLD"), json!(true)), (json!("OLD"), json!(false))]
+        );
+        assert!(!log.iter().any(|c| c["method"] == "Page.startScreencast"));
+    }
+
+    #[tokio::test]
+    async fn test_focus_delayed_enable_rebind_cleans_old_owner_before_new_capture() {
+        let (h, commands) = focus_harness(
+            Some("OLD"),
+            "chrome",
+            false,
+            false,
+            std::time::Duration::from_millis(1200),
+        )
+        .await;
+        wait_commands(&commands, "Emulation.setFocusEmulationEnabled", 1).await;
+        let client = h.client_slot.read().await.clone().unwrap();
+        *h.cdp_session_id.write().await =
+            super::super::StreamBinding::new(Some("NEW".into()), Some(&client));
+        h.client_notify.notify_one();
+        wait_commands(&commands, "Page.startScreencast", 1).await;
+        stop_loop(h).await;
+        let log = commands.lock().await;
+        assert!(log
+            .iter()
+            .filter(|c| c["method"] == "Page.startScreencast")
+            .all(|c| c["sessionId"] == "NEW"));
+        assert_eq!(
+            focus_commands(&log),
+            vec![
+                (json!("OLD"), json!(true)),
+                (json!("OLD"), json!(false)),
+                (json!("NEW"), json!(true)),
+                (json!("NEW"), json!(false))
+            ]
+        );
     }
 
     #[test]

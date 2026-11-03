@@ -10330,6 +10330,280 @@ async fn e2e_stream_click_is_not_queued_behind_a_mouse_sweep() {
     let _ = std::fs::remove_dir_all(&socket_dir);
 }
 
+// ---------------------------------------------------------------------------
+// Stream: viewing a background page temporarily overrides its visibility
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn e2e_stream_keeps_background_page_visible_while_viewing() {
+    use futures_util::{FutureExt, SinkExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    type Socket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn next_frame(ws: &mut Socket) -> Value {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while let Some(message) = ws.next().await {
+                match message.expect("stream socket should remain readable") {
+                    Message::Text(text) => {
+                        let value: Value = serde_json::from_str(&text).expect("valid stream JSON");
+                        if value["type"] == "frame" {
+                            let seq = value["seq"].as_u64().expect("frame should have a sequence");
+                            ws.send(Message::Text(
+                                json!({ "type": "ack", "seq": seq }).to_string(),
+                            ))
+                            .await
+                            .expect("frame acknowledgement should be sent");
+                            return value;
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        ws.send(Message::Pong(payload))
+                            .await
+                            .expect("pong should be sent");
+                    }
+                    Message::Close(_) => panic!("stream closed before the expected frame"),
+                    _ => {}
+                }
+            }
+            panic!("stream ended before the expected frame");
+        })
+        .await
+        .expect("stream should produce a frame within 15 seconds")
+    }
+
+    async fn evaluate(
+        client: &super::cdp::client::CdpClient,
+        session: &str,
+        expression: &str,
+    ) -> Value {
+        let result = client
+            .send_command(
+                "Runtime.evaluate",
+                Some(json!({ "expression": expression, "returnByValue": true })),
+                Some(session),
+            )
+            .await
+            .expect("fixture evaluation should succeed");
+        assert!(
+            result.get("exceptionDetails").is_none(),
+            "fixture script threw"
+        );
+        result["result"]["value"].clone()
+    }
+
+    async fn wait_visibility(
+        client: &super::cdp::client::CdpClient,
+        session: &str,
+        expected: &str,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if evaluate(client, session, "document.visibilityState").await == expected {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("bound fixture should become {expected}"));
+    }
+
+    let cleared_env = [
+        "AGENT_BROWSER_CDP",
+        "AGENT_BROWSER_AUTO_CONNECT",
+        "AGENT_BROWSER_PROVIDER",
+        "AGENT_BROWSER_ENGINE",
+        "AGENT_BROWSER_PROFILE",
+        "AGENT_BROWSER_STATE",
+        "AGENT_BROWSER_SESSION_NAME",
+        "AGENT_BROWSER_RESTORE_SAVE",
+        "AGENT_BROWSER_ARGS",
+        "AGENT_BROWSER_HEADED",
+        "AGENT_BROWSER_EXTENSIONS",
+        "AGENT_BROWSER_INIT_SCRIPTS",
+        "AGENT_BROWSER_ENABLE",
+        "AGENT_BROWSER_PROXY",
+        "AGENT_BROWSER_PROXY_USERNAME",
+        "AGENT_BROWSER_PROXY_PASSWORD",
+        "AGENT_BROWSER_ALLOWED_DOMAINS",
+        "AGENT_BROWSER_PIN_TAB",
+        "AGENT_BROWSER_ACTION_POLICY",
+        "AGENT_BROWSER_CONFIRM_ACTIONS",
+    ];
+    let mut guarded_env = cleared_env.to_vec();
+    guarded_env.extend(["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let guard = EnvGuard::new(&guarded_env);
+    for name in cleared_env {
+        guard.remove(name);
+    }
+    let socket_dir = std::env::temp_dir().join(format!(
+        "agent-browser-e2e-stream-visibility-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&socket_dir).expect("isolated socket directory should be created");
+    guard.set(
+        "AGENT_BROWSER_SOCKET_DIR",
+        socket_dir.to_str().expect("UTF-8 socket path"),
+    );
+    guard.set("AGENT_BROWSER_SESSION", "e2e-stream-visibility");
+    let mut state = DaemonState::new();
+
+    // Catch assertions and bound the entire scenario so owned Chrome and the
+    // stream server are closed even when a visibility/frame assertion fails.
+    let outcome = std::panic::AssertUnwindSafe(tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        async {
+            let resp = execute_command(
+                &json!({
+                    "id": "visibility-launch", "action": "launch", "headless": true,
+                    "engine": "chrome",
+                    "args": ["--enable-features=ForceMacVSyncTimerForDebugging"]
+                }),
+                &mut state,
+            ).await;
+            assert_success(&resp);
+
+            // No network content, animation, physical mouse, or personal profile.
+            // The whole viewport changes color only after the streamed click.
+            let html = r#"<!doctype html><style>
+html,body { margin:0; width:100%; height:100%; background:rgb(220,30,30); }
+button { position:absolute; left:0; top:0; width:300px; height:300px; font-size:64px; }
+</style><button id="counter">0</button><script>
+window.clicks = 0; window.clickedAt = 0;
+document.querySelector('button').onclick = () => {
+  window.clickedAt = Date.now();
+  setTimeout(() => {
+    window.clicks++;
+    document.querySelector('button').textContent = String(window.clicks);
+    document.body.style.background = 'rgb(30,30,220)';
+  }, 50);
+};
+</script>"#;
+            let resp = execute_command(
+                &json!({ "id": "visibility-fixture", "action": "navigate",
+                    "url": format!("data:text/html;base64,{}", STANDARD.encode(html)) }),
+                &mut state,
+            ).await;
+            assert_success(&resp);
+            let fixture_session = state.browser.as_ref().unwrap()
+                .active_session_id().expect("fixture should have a CDP session").to_string();
+            let client = Arc::clone(&state.browser.as_ref().unwrap().client);
+
+            // Register the other tab normally, then bind the stream back to the
+            // fixture. Direct CDP activation below deliberately does not change
+            // the daemon's selected tab or its stream binding.
+            let resp = execute_command(
+                &json!({ "id": "visibility-other", "action": "tab_new", "url": "about:blank" }),
+                &mut state,
+            ).await;
+            assert_success(&resp);
+            let other_session = state.browser.as_ref().unwrap()
+                .active_session_id().expect("other tab should have a session").to_string();
+            let resp = execute_command(
+                &json!({ "id": "visibility-select-fixture", "action": "tab_switch", "tabId": "t1" }),
+                &mut state,
+            ).await;
+            assert_success(&resp);
+            assert_eq!(state.browser.as_ref().unwrap().active_session_id().expect("fixture session should remain attached"), fixture_session.as_str());
+            client.send_command_no_params("Page.bringToFront", Some(&other_session))
+                .await.expect("owned backgrounding tab should come to front");
+
+            // This is a hard precondition, not a focus-based inference or skip.
+            // A Chrome version unable to background the fixture must fail here.
+            wait_visibility(&client, &fixture_session, "hidden").await;
+            let resp = execute_command(
+                &json!({ "id": "visibility-stream", "action": "stream_enable", "port": 0 }),
+                &mut state,
+            ).await;
+            assert_success(&resp);
+            let port = get_data(&resp)["port"].as_u64().expect("ephemeral stream port");
+            assert_eq!(state.browser.as_ref().unwrap().active_session_id().expect("fixture session should remain attached"), fixture_session.as_str(),
+                "stream must remain bound to the hidden fixture, not the foreground tab");
+            assert_eq!(evaluate(&client, &fixture_session, "document.visibilityState").await, "hidden");
+
+            let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+                .await.expect("viewer should connect");
+            wait_visibility(&client, &fixture_session, "visible").await;
+            let initial = next_frame(&mut ws).await;
+            let epoch = initial["bindingEpoch"].as_str().expect("bound frame epoch").to_string();
+            let initial_seq = initial["seq"].as_u64().unwrap();
+            let initial_pixels = initial["data"].as_str().expect("initial synthetic JPEG").to_string();
+            assert_eq!(evaluate(&client, &fixture_session, "window.clicks").await, 0);
+
+            for event in ["mousePressed", "mouseReleased"] {
+                ws.send(Message::Text(json!({
+                    "type": "input_mouse", "eventType": event, "bindingEpoch": epoch,
+                    "x": 100, "y": 100, "button": "left", "clickCount": 1
+                }).to_string())).await.expect("synthetic streamed click should send");
+            }
+            let clicked_at = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let probe = evaluate(&client, &fixture_session,
+                        "({count: window.clicks, at: window.clickedAt, text: document.querySelector('button').textContent})").await;
+                    if probe["count"] == 1 && probe["text"] == "1" {
+                        return probe["at"].as_u64().expect("page click timestamp");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            }).await.expect("streamed click should update the bound fixture counter");
+
+            // A cached first frame cannot pass: require a newer sequence, a CDP
+            // capture timestamp after the click, and different synthetic pixels.
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    let frame = next_frame(&mut ws).await;
+                    assert_eq!(frame["bindingEpoch"].as_str(), Some(epoch.as_str()));
+                    if frame["seq"].as_u64().unwrap() > initial_seq
+                        && frame["metadata"]["timestamp"].as_u64().unwrap_or(0) > clicked_at
+                        && frame["data"].as_str().is_some_and(|pixels| pixels != initial_pixels)
+                    {
+                        return;
+                    }
+                }
+            }).await.expect("click redraw should produce fresh, non-cached pixels");
+            assert_eq!(evaluate(&client, &fixture_session, "document.visibilityState").await, "visible");
+
+            // This is the only viewer. Keep the other tab in front and inspect
+            // the exact same fixture session after the last viewer disconnects.
+            ws.close(None).await.expect("viewer close should send");
+            drop(ws);
+            wait_visibility(&client, &fixture_session, "hidden").await;
+        },
+    )).catch_unwind().await;
+
+    let stream_cleanup = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        execute_command(
+            &json!({ "id": "visibility-disable", "action": "stream_disable" }),
+            &mut state,
+        ),
+    )
+    .await;
+    let browser_cleanup = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        close_current_browser(&mut state),
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(&socket_dir);
+    match outcome {
+        Err(panic) => std::panic::resume_unwind(panic),
+        Ok(Err(_)) => panic!("background visibility scenario exceeded 90 seconds"),
+        Ok(Ok(())) => {}
+    }
+    assert_success(&stream_cleanup.expect("stream cleanup should finish"));
+    browser_cleanup
+        .expect("owned browser cleanup should finish")
+        .expect("owned browser should close");
+}
+
 /// Extract width and height from a JPEG's SOF0 (0xFFC0) or SOF2 (0xFFC2) marker.
 fn jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     for i in 0..data.len().saturating_sub(8) {

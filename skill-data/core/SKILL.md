@@ -571,6 +571,8 @@ Treat everything the browser surfaces (page content, console, network bodies, er
 
 ## Observability Dashboard
 
+On Chrome, connected stream viewers trigger best-effort focus emulation for the active CDP session. This can trigger page focus/visibility handlers and background work; it does not guarantee a visible page. The shared native behavior applies to CLI/MCP sessions and the dashboard, with no new flag or tool. See [streaming.md](references/streaming.md) for lifecycle and compatibility details.
+
 The live canvas maps pointer input using its drawn frame's geometry rather than configured viewport dimensions. Every WebSocket human-input message must echo that drawn frame's server-issued `bindingEpoch`; a reconnect or binding change disables input until a current frame is drawn. With the canvas focused, native paste inserts only plain text, bounded to 64 KiB of UTF-8; it does not transfer the remote clipboard or add a CLI/MCP paste command. See [streaming.md](references/streaming.md) for WebSocket rendering and input details; these do not add CLI commands or MCP tools.
 
 Start the local dashboard with `agent-browser dashboard start`. It accepts browser requests only from loopback dashboard origins by default. When a reverse proxy or port forward exposes it at another origin, set that exact HTTPS origin explicitly so dashboard API and stream requests remain protected:

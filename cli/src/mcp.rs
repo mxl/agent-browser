@@ -3915,6 +3915,8 @@ fn dashboard_start_args(arguments: &Value) -> Result<Vec<String>, ProtocolError>
 
 // Canvas geometry, binding epochs, and plain-text paste are WebSocket concerns.
 // There is no dedicated CLI/MCP input_text tool; paste belongs to canvas focus.
+// Viewer-scoped Chrome focus emulation belongs to the shared native stream
+// implementation, not a new dedicated MCP tool or dashboard-start option.
 // Keep dashboard startup delegated through the canonical CLI parser.
 fn call_dashboard_start(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, dashboard_start_args(arguments)?, None)
