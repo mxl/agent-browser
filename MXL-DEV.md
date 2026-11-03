@@ -22,6 +22,12 @@ Plain-text paste uses the user's paste event rather than polling the clipboard o
 
 A binding token identifies the target/client binding, not a particular document. Same-target navigation needs separate qualification. Releases for an obsolete binding are dropped instead of being routed to a new target, so cleanup of held keys in the former target is not guaranteed. These checks do not hide pasted text from trusted local processes, the dashboard, CDP, or the destination page.
 
+## Prepared Chrome stream visibility fix
+
+`fix/stream-hidden-page-visibility` prepares a viewer-scoped focus-emulation change; it is not evidence that the integration branch or an installed binary contains the fix. While stream viewers are connected, Chrome requests focus emulation on the active CDP binding before screencasting and retains it across viewport restarts. Last-viewer disconnect, rebinding, and stream shutdown attempt cleanup on the exact old binding. Unsupported methods leave streaming available, and visibility is not guaranteed. This can trigger page focus/visibility handlers and background work. Other engines and existing binding-epoch/navigation/held-key limits are unchanged.
+
+Validation must cover viewer lifecycle, viewport restarts, rebinding, unsupported-method fallback, and cleanup. Backend mock tests can verify CDP ordering and binding ownership, but do not establish real-browser visibility or application behavior. Browser validation and installation remain separate coordinated steps; this preparation does not authorize either.
+
 ## Build from the integration branch
 
 Use Node.js 24 or later, Rust, and the pnpm version pinned in `package.json`.

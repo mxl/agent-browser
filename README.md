@@ -1705,6 +1705,8 @@ agent-browser stream disable              # Stop streaming for the session
 
 The WebSocket server streams the browser viewport and accepts input events.
 
+On Chrome, connected stream viewers cause the daemon to request focus emulation on the active CDP session before starting the screencast. The request stays in effect across viewport-driven screencast restarts while any viewer remains connected. The daemon attempts to disable it on the last viewer's disconnect, a binding change, or stream shutdown. This can trigger page focus/visibility handlers and background work. Unsupported methods do not stop streaming, and page visibility is not guaranteed. Other engines are unchanged; this shared native behavior applies to CLI- and MCP-created sessions and the dashboard without a new flag or protocol message.
+
 ### WebSocket Protocol
 
 Connect to `ws://localhost:9223` to receive frames and send input:

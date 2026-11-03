@@ -48,6 +48,12 @@ Use [Video Recording](/recording) when you need a saved WebM or MP4 artifact ins
 
 The lower-level `screencast_start` and `screencast_stop` commands still control explicit CDP screencasts directly. Use them when you want a screencast without the WebSocket runtime server.
 
+## Chrome focus and visibility
+
+A hidden Chrome page can accept input while its streamed image stops repainting. While at least one stream viewer is connected, the daemon requests `Emulation.setFocusEmulationEnabled(true)` on the active bound Chrome CDP session before starting the screencast. It retains the request across viewport-driven screencast restarts. When the last viewer disconnects, the binding changes, or streaming shuts down, it attempts to disable focus emulation on that exact old binding rather than a replacement target.
+
+This can trigger page focus/visibility handlers and background work. Focus emulation and cleanup are best effort: unsupported methods do not stop streaming, and the page is not guaranteed to remain visible. Other engines are unchanged. CLI/MCP sessions and the dashboard share this native behavior without a new flag, environment variable, protocol message, or dedicated MCP tool. The binding-epoch input protections and navigation/held-key limitations below still apply.
+
 ## WebSocket protocol
 
 Connect to `ws://localhost:9223` to receive frames and send input.

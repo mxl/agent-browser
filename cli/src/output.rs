@@ -3331,6 +3331,10 @@ Focus the live canvas for native plain-text paste (up to 64 KiB UTF-8).
 Paste inserts text, not HTML/images or the remote clipboard. Empty and
 oversized payloads are rejected. Blur releases keys with their original epoch.
 These WebSocket behaviors add no CLI command or MCP tool.
+Connected Chrome stream viewers request best-effort focus emulation on the
+active CDP session. This can trigger page focus/visibility handlers and
+background work, but does not guarantee visibility. Other engines are unchanged.
+See 'agent-browser stream --help' for viewer lifetime and cleanup behavior.
 
 Subcommands:
   start [--port <n>] [--allowed-origins <origins>]
@@ -3440,6 +3444,13 @@ available localhost port automatically and reports it back.
 Notes:
   - 'stream enable' creates the WebSocket server.
   - WebSocket clients trigger frame streaming automatically.
+  - On Chrome, any connected viewer requests focus emulation on the active
+    CDP session before screencasting. It persists across viewport restarts.
+    Last-viewer disconnect, rebinding, and shutdown attempt cleanup on the
+    exact old binding. Unsupported methods do not stop streaming; visibility
+    is not guaranteed. Page focus/visibility handlers and background work may
+    run. Other engines are unchanged. CLI/MCP sessions and dashboard viewers
+    share this behavior without a new flag, protocol message, or MCP tool.
   - On Chrome, URL messages follow full-document, History API, and fragment
     navigation in the active tab's main frame. Child-frame and background-tab
     navigation does not emit URL messages.

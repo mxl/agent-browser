@@ -8,6 +8,7 @@ Stream a session's viewport over WebSocket and drive it with remote input. This 
 
 - [Enabling the stream](#enabling-the-stream)
 - [Connecting](#connecting)
+- [Chrome focus and visibility](#chrome-focus-and-visibility)
 - [Messages from the server](#messages-from-the-server)
 - [Messages from the client](#messages-from-the-client)
 - [Frame rate and staleness](#frame-rate-and-staleness)
@@ -40,6 +41,12 @@ Read the port from `stream status --json` rather than assuming one; the OS-assig
 ## Connecting
 
 Connect a WebSocket client to `ws://127.0.0.1:<port>`. Frame delivery starts automatically once a client attaches, so there is no subscribe message. Browser clients must load from `localhost`, `127.0.0.1`, `::1` or `file://`. Any other origin gets a 403 on the upgrade and needs a proxy.
+
+## Chrome focus and visibility
+
+A hidden Chrome page can accept input while its streamed image stops repainting. When the aggregate stream viewer count is greater than zero, the daemon requests `Emulation.setFocusEmulationEnabled(true)` on the active bound Chrome CDP session before starting the screencast. It retains the request across viewport-driven screencast restarts while viewers remain connected. On the last viewer's disconnect, a binding change, or stream shutdown, it attempts `Emulation.setFocusEmulationEnabled(false)` on the exact old binding, not a replacement target.
+
+Focus emulation can trigger page focus/visibility handlers and background work. It is best effort: an unsupported method does not stop streaming, cleanup may fail, and the page is not guaranteed to remain visible. Other engines are unchanged. CLI/MCP sessions and the dashboard share this native implementation; there is no new flag, environment variable, WebSocket message, or dedicated MCP tool. Existing binding-epoch input protections and the navigation/held-key limitations below still apply.
 
 ## Messages from the server
 
